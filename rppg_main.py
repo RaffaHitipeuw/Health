@@ -136,13 +136,27 @@ def draw_spectrum_graph(canvas, freqs, power, peak_bpm, h, w):
 def draw_vitals_panel(canvas, vitals: VitalsResult, baseline_dev: dict, h: int, w: int):
     draw_panel(canvas, 0, 0, w, h)
 
+    # Bug fix: BPM was missing from this panel entirely.
+    # The panel is the only persistent display of vitals — users looking here
+    # for their heart rate found every metric except the primary one.
+    # BPM confidence colour mirrors the 4-tier scheme used in the main overlay.
+    sqi_val = getattr(vitals, "sqi", 0.0)
+    bpm_color = (PALETTE["green"]  if sqi_val >= 55 else
+                 PALETTE["yellow"] if sqi_val >= 35 else
+                 PALETTE["orange"] if sqi_val >= 18 else
+                 PALETTE["red_bright"])
+    bpm_label = PALETTE["red_bright"] if vitals.stress_index > 60 else PALETTE["yellow"]
+
     rows = [
+        # BPM is the primary metric — show it first, full-width style (col 0)
+        ("BPM",      f"{vitals.bpm:.0f}" if vitals.bpm > 0 else "--",
+                                             "bpm",    bpm_color),
         ("RESP",     f"{vitals.resp_rate:.1f}",   "br/min",  PALETTE["cyan"]),
         ("HRV SDNN", f"{vitals.hrv_sdnn:.1f}",    "ms",      PALETTE["purple"]),
         ("HRV RMSSD", f"{vitals.hrv_rmssd:.1f}",  "ms",      PALETTE["purple"]),
         ("pNN50",    f"{vitals.hrv_pnn50:.1f}",    "%",       PALETTE["yellow"]),
         ("LF/HF",    f"{vitals.lf_hf_ratio:.2f}",  "",       PALETTE["orange"]),
-        ("STRESS",   f"{vitals.stress_index:.0f}", "/100",    PALETTE["red_bright"] if vitals.stress_index > 60 else PALETTE["yellow"]),
+        ("STRESS",   f"{vitals.stress_index:.0f}", "/100",    bpm_label),
     ]
 
     col_w = w // 3
@@ -150,7 +164,7 @@ def draw_vitals_panel(canvas, vitals: VitalsResult, baseline_dev: dict, h: int, 
         col  = i % 3
         row  = i // 3
         cx   = col * col_w + 8
-        cy   = row * (h // 2) + 28
+        cy   = row * (h // 3) + 28   # 3 rows now (was 2) — spread over panel height
         put_text(canvas, label, cx, cy - 14, 0.38, PALETTE["gray"])
         put_text(canvas, val,   cx, cy,      0.72, color, 2)
         if unit:
@@ -436,11 +450,24 @@ def main():
         if not fr.motion_rejected:
             vitals_engine.ingest_signal(fr.chrom_signal, fr.fused_bpm, fr.fused_sqi)
 
+        # Bug fix (two issues combined):
+        #
+        # 1. `MIN_FRAMES` here was the *main loop* constant (synced to cfg=60),
+        #    but VitalsEngine.MIN_FRAMES was hardcoded to 120 — so even after
+        #    this gate passed, compute() still returned early.  Both are now
+        #    cfg.MIN_FRAMES (60), so the gate and the engine agree.
+        #    Use vitals_engine.MIN_FRAMES explicitly so they stay in sync.
+        #
+        # 2. `SQI_HARD_GATE * 0.7` = 14% at gate=20 — this is almost always
+        #    true and adds no protection.  The real guard belongs inside
+        #    compute() which already handles low-SQI gracefully (returns
+        #    partial VitalsResult with confidence_label="LOW").
+        #    Remove the SQI gate here; let compute() decide what to compute.
         _vitals_ready = (
             frame_count % 15 == 0
-            and len(fr.chrom_signal) >= MIN_FRAMES
+            and len(fr.chrom_signal) >= vitals_engine.MIN_FRAMES  # synced to cfg
             and not fr.motion_rejected
-            and fr.fused_sqi >= SQI_HARD_GATE * 0.7
+            # SQI gate removed — compute() handles low quality internally
         )
         if _vitals_ready:
             vitals_result = vitals_engine.compute(fr.chrom_signal, fr.fused_bpm, fr.fused_sqi)
@@ -565,11 +592,24 @@ def main():
                          W // 2 - 130, 22, 0.45, bdev_c)
 
         elif fr.fused_bpm > 0 and fr.fused_sqi < SQI_HARD_GATE:
-            put_text(frame, f"Signal low (SQI:{fr.fused_sqi:.0f}% < gate:{SQI_HARD_GATE:.0f}%)",
-                     20, 44, 0.65, PALETTE["orange"])
+            # Bug fix: this branch was only reachable when display_bpm==0 but
+            # fused_bpm>0 -- e.g. during startup grace period while SQI is
+            # already low.  In that edge-case we STILL want to show the BPM
+            # (v12 intent: "color communicates confidence, not show/hide") and
+            # append a dimmed sub-label so the user understands quality is low.
+            # We also push to display_bpm here so the next frame's holdover
+            # logic has a valid base to carry forward.
+            _show_bpm   = fr.fused_bpm
+            display_bpm = fr.fused_bpm          # ensure holdover has a value
+            last_valid_bpm    = fr.fused_bpm
+            last_valid_bpm_ts = now
+            put_text(frame, f"BPM: {_show_bpm:.0f}", 20, 44, 1.2,
+                     PALETTE["orange"], 2)       # orange = low-confidence colour
+            put_text(frame, f"low signal  SQI:{fr.fused_sqi:.0f}%",
+                     20, 58, 0.38, PALETTE["orange"])
             if sqi_explanations:
                 put_text(frame, "WHY: " + " | ".join(sqi_explanations[:2]),
-                         20, 62, 0.38, PALETTE["gray"])
+                         20, 68, 0.38, PALETTE["gray"])
         else:
             n_bufs = max(len(v.buf_g) for v in fusion_engine.rois.values())
             pct    = min(int(n_bufs / MIN_FRAMES * 100), 100)

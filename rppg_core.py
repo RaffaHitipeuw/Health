@@ -57,6 +57,16 @@ ROI_CONFIGS = {
     "cheek_right": {"landmarks": CHEEK_RIGHT_LANDMARKS, "base_weight": 1.0},
 }
 
+
+def _rppg_warn(context: str, exc: Exception, once_key: str = "") -> None:
+    """Emit a RuntimeWarning instead of swallowing exceptions silently.
+    Replaces bare 'except Exception: pass' so errors surface during dev
+    without crashing the real-time loop in production."""
+    import warnings
+    warnings.warn(f"[rPPG] {context}: {type(exc).__name__}: {exc}",
+                  RuntimeWarning, stacklevel=3)
+
+
 # ─── Data containers ──────────────────────────────────────────────────────────
 
 @dataclass
@@ -877,7 +887,9 @@ class MultiROIFusionEngine:
                     else: roi._bad_streak = max(0, roi._bad_streak - 2)
                     if sqi>result.sqi_breakdown.get("overall",0) and motion_score<=self.motion_detector.enter_threshold:
                         result.freqs=freqs; result.power=power; result.sqi_breakdown=breakdown
-            except Exception: roi.sqi=0.0
+            except Exception as _exc:
+                roi.sqi = 0.0
+                _rppg_warn(f'ROI processing (frame {getattr(self,"frame_count",0)})', _exc)
         best_sqi=max((r.sqi for r in valid_rois.values()),default=0.0); best_bpm=max((r.bpm for r in valid_rois.values() if BPM_LOW<=r.bpm<=BPM_HIGH),default=0.0)
         result.in_calibration=self.calibration.update(best_sqi,best_bpm)
         # v12: try with SQI gate first, fallback to best available ROI
@@ -974,7 +986,7 @@ class PerPixelQualityFilter:
             try:
                 stack=np.stack(list(self._roi_history[roi_name]),axis=0); tv=cv2.resize(np.std(stack,axis=0),(w,h),interpolation=cv2.INTER_LINEAR)
                 qm=cv2.bitwise_and(qm,(tv<=np.percentile(tv,90)).astype(np.uint8)*255)
-            except Exception: pass
+            except Exception as _exc: _rppg_warn('PerPixelQualityFilter temporal', _exc)
         vc=cv2.countNonZero(qm)
         if vc<5: return float(roi_bgr[:,:,2].mean()),float(roi_bgr[:,:,1].mean()),float(roi_bgr[:,:,0].mean()),0.0,qm
         return float(cv2.mean(roi_bgr[:,:,2],mask=qm)[0]),float(cv2.mean(roi_bgr[:,:,1],mask=qm)[0]),float(cv2.mean(roi_bgr[:,:,0],mask=qm)[0]),vc/max(h*w,1),qm
@@ -1063,7 +1075,7 @@ class RespiratoryArtifactSuppressor:
             br,ar=butter(3,[lo,hi],btype="band"); resp=filtfilt(br,ar,signal); freqs,psd=welch(resp,fs=fps,nperseg=min(len(resp),128)); mask=(freqs>=0.1)&(freqs<=0.5)
             if np.any(mask): self._resp_freq_hz=float(freqs[mask][np.argmax(psd[mask])]); self._resp_history.append(self._resp_freq_hz)
             if self._resp_history: self._resp_freq_hz=float(np.median(self._resp_history))
-        except Exception: pass
+        except Exception as _exc: _rppg_warn('RespiratoryArtifactSuppressor.update_resp_freq', _exc)
     def suppress(self,signal,fps):
         try:
             nyq=fps/2.0
@@ -1074,7 +1086,7 @@ class RespiratoryArtifactSuppressor:
             if FREQ_LOW<=h2<=FREQ_HIGH and h2<nyq:
                 h2n=h2/nyq
                 if 0.01<h2n<0.99: bh,ah=iirnotch(h2n,9.6); signal=filtfilt(bh,ah,signal)
-        except Exception: pass
+        except Exception as _exc: _rppg_warn('RespiratoryArtifactSuppressor.suppress -- returning unfiltered signal', _exc)
         return signal
 
 class HeadPoseGate:
@@ -1098,7 +1110,7 @@ class JawBlinkSuppressor:
             if jaw_open-baseline>self.jaw_open_threshold: self._talking_frames+=1
             else: self._talking_frames=max(0,self._talking_frames-1)
             r["talking"]=self._talking_frames>=3; r["jaw_open_normalized"]=round(float(jaw_open),4); la=abs(lm[self.L_EYE_TOP].y-lm[self.L_EYE_BOT].y)*h/fh; ra=abs(lm[self.R_EYE_TOP].y-lm[self.R_EYE_BOT].y)*h/fh; eye_ap=(la+ra)/2.0; self._blink_history.append(eye_ap); r["blinking"]=eye_ap<self.blink_threshold; r["eye_aperture"]=round(float(eye_ap),4); r["suppress_cheeks"]=(r["talking"] or r["blinking"]) if self._init_frames>=20 else False
-        except Exception: pass
+        except Exception as _exc: _rppg_warn('JawBlinkSuppressor.update -- returning default dict', _exc)
         return r
 
 class ReproducibilityLogger:
@@ -1182,7 +1194,9 @@ class MultiROIFusionEngineV2(MultiROIFusionEngine):
                 if self.enable_logging and self.repro_logger: self.repro_logger.log_frame(now,roi_name,float(arr_r[-1]),float(arr_g[-1]),float(arr_b[-1]),bpm_raw,sqi); self.repro_logger.log_sqi(now,roi_name,sqi,breakdown)
                 if sqi>result.sqi_breakdown.get("overall",0) and len(sf)>0: result.freqs=freqs; result.power=power; result.sqi_breakdown=breakdown
                 if len(sf)>0 and sqi>0: weighted_sigs.append((sf,sqi,roi_name))
-            except Exception: roi.sqi=0.0
+            except Exception as _exc:
+                roi.sqi = 0.0
+                _rppg_warn(f'ROI processing (frame {getattr(self,"frame_count",0)})', _exc)
         bs=max((v[0].sqi for v in valid_rois_res.values()),default=0.0); bb=max((v[0].bpm for v in valid_rois_res.values() if BPM_LOW<=v[0].bpm<=BPM_HIGH),default=0.0); result.in_calibration=self.calibration.update(bs,bb)
         avb=[v[0].bpm for v in valid_rois_res.values() if BPM_LOW<=v[0].bpm<=BPM_HIGH and v[0].sqi>=SQI_HARD_GATE]
         if len(avb)>=2:

@@ -6,7 +6,10 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 import time
-BASELINE_SQI_GATE = 50.0
+# Bug fix: was hardcoded 50.0 — out of sync with cfg.BASELINE_SQI_THRESHOLD (45.0).
+# Using cfg ensures the gate matches the rest of the system. When both values
+# differ, calibration rejects frames that every other module already accepted.
+BASELINE_SQI_GATE = cfg.BASELINE_SQI_THRESHOLD  # 45.0
 
 @dataclass
 class VitalsResult:
@@ -116,7 +119,10 @@ class VitalsEngine:
 
     def __init__(self, fps: float=30.0):
         self.fps = fps
-        self.MIN_FRAMES = 120
+        # Bug fix: was hardcoded 120 -- mismatch with cfg.MIN_FRAMES (60).
+        # At 60/60 frames the engine returned early so BPM/HRV never appeared
+        # until the buffer hit 120. Single source of truth: cfg.MIN_FRAMES.
+        self.MIN_FRAMES = cfg.MIN_FRAMES  # 60
         self.ibi_history = deque(maxlen=200)
         self.bpm_history = deque(maxlen=30)
         self.resp_history = deque(maxlen=30)
