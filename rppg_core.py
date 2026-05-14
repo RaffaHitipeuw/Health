@@ -178,7 +178,7 @@ class BPMSmoother:
         self.raw_history   = deque(maxlen=self.median_window)
         self.ema_val: Optional[float] = None
         self._last_accepted: Optional[float] = None
-        self.kalman = KalmanBPMFilter(q_bpm=0.1, q_vel=0.01, r_bpm=5.0)
+        self.kalman = KalmanBPMFilter(q_bpm=cfg.KALMAN_Q_BPM, q_vel=cfg.KALMAN_Q_VEL, r_bpm=cfg.KALMAN_R_BPM)
         self._recent: deque = deque(maxlen=cfg.TEMPORAL_HISTORY_LEN)
 
         self._stable_history: deque = deque(maxlen=int(cfg.STABLE_LOCK_SECONDS * 30))
@@ -251,7 +251,7 @@ class BPMSmoother:
                     self._lock_center = float(np.mean(self._stable_history))
             else:
                 self._is_locked = False
-        return self.ema_val
+        return final
 
     def reset(self):
         self.raw_history.clear(); self.ema_val = None; self._last_accepted = None
