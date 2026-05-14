@@ -1,38 +1,35 @@
-"""
-rppg_core.py  -  Multi-ROI rPPG fusion engine  (ALL 12 FIXES APPLIED + SQI REBALANCING)
-Fix #1  Hard dominance rules in dynamic weight (SNR/agreement kill switches)
-Fix #2  Temporal+physiological truth-aware agreement
-Fix #3  EMA + sliding-median temporal smoothing at decision layer
-Fix #4  Rebalanced SQI component weights (SNR dominant, capped penalties)
-Fix #5  Outlier ROI rejection BEFORE fusion (median-distance gate)
-Fix #6  Exposure drift as hard weight penalty + output freeze on extreme drift
-Fix #7  Session confidence rebuilt from SQI x consistency x agreement
-Fix #8  Arrhythmia gated behind SQI >= 65
-Fix #9  All constants centralised in rppg_config.py
-Fix #10 Calibration phase (first N frames as baseline)
-Fix #12 Hierarchical fusion: filter->cluster->fuse
-"""
+
+
 
 import cv2
 import numpy as np
-from scipy.signal import butter, filtfilt, welch, detrend as scipy_detrend, find_peaks, iirnotch
+from scipy.signal import butter, filtfilt, welch, detrend as scipy_detrend, find_peaks, iirnotch, sosfilt
 from scipy.stats import pearsonr
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 import time
 
-# Fix #9: Central config
+
 from rppg_config import cfg
 from rppg_algorithms import get_algorithm_by_name
 from rppg_temporal import KalmanBPMFilter, ProbabilisticFusion
 from rppg_sqi import StatisticallyCalibratedSQI, LearnedWeighting
-from rppg_signal import apply_windowing, mature_harmonic_rejection, respiratory_interference_analysis
+from rppg_physio_state import (
+    PhysiologicalStateClassifier, PantingAdaptiveHR,
+    PhysioState, PhysioStateResult,
+)
+from rppg_signal import (
+    apply_windowing, mature_harmonic_rejection,
+    respiratory_interference_analysis, estimate_respiratory_rate,
+    extract_pos_with_phase, phase_coherence_cardiac_fraction,
+    OpticalFlowROIStabilizer, PulseRichPixelSelector,
+)
 from rppg_uncertainty import UncertaintyAwareConfidence, propagate_variance
 from rppg_roi import AdaptiveROIManager
 from rppg_benchmark import ReproducibilityProtocol
 
-# Backward-compat module-level names
+
 BUFFER_SIZE            = cfg.BUFFER_SIZE
 FPS_TARGET             = cfg.FPS_TARGET
 BPM_LOW                = cfg.BPM_LOW
@@ -46,28 +43,28 @@ BASELINE_SQI_THRESHOLD = cfg.BASELINE_SQI_THRESHOLD
 MOTION_ENTER_THRESHOLD = cfg.MOTION_ENTER_THRESHOLD
 MOTION_EXIT_THRESHOLD  = cfg.MOTION_EXIT_THRESHOLD
 
-FOREHEAD_LANDMARKS = [10, 338, 297, 299, 337, 151, 108, 69, 67, 109]
+
+FOREHEAD_LANDMARKS = [109, 67, 108, 151, 337, 297, 338]
 CHEEK_LEFT_LANDMARKS = [
     50, 101, 118, 117, 116, 123, 147, 187, 207, 206, 205, 36, 142, 126, 100, 203]
 CHEEK_RIGHT_LANDMARKS = [
     280, 330, 347, 346, 345, 352, 376, 411, 427, 426, 425, 266, 371, 355, 329, 423]
 ROI_CONFIGS = {
-    "forehead":    {"landmarks": FOREHEAD_LANDMARKS,    "base_weight": 1.5},
-    "cheek_left":  {"landmarks": CHEEK_LEFT_LANDMARKS,  "base_weight": 1.0},
-    "cheek_right": {"landmarks": CHEEK_RIGHT_LANDMARKS, "base_weight": 1.0},
+    "forehead":    {"landmarks": FOREHEAD_LANDMARKS,    "base_weight": 0.7},
+    "cheek_left":  {"landmarks": CHEEK_LEFT_LANDMARKS,  "base_weight": 0.3},
+    "cheek_right": {"landmarks": CHEEK_RIGHT_LANDMARKS, "base_weight": 0.3},
+
+
 }
 
 
 def _rppg_warn(context: str, exc: Exception, once_key: str = "") -> None:
-    """Emit a RuntimeWarning instead of swallowing exceptions silently.
-    Replaces bare 'except Exception: pass' so errors surface during dev
-    without crashing the real-time loop in production."""
+
+
     import warnings
     warnings.warn(f"[rPPG] {context}: {type(exc).__name__}: {exc}",
                   RuntimeWarning, stacklevel=3)
 
-
-# ─── Data containers ──────────────────────────────────────────────────────────
 
 @dataclass
 class ROISignal:
@@ -89,11 +86,11 @@ class ROISignal:
     agreement_factor: float = 1.0
     _reg_history: object = field(default_factory=lambda: deque(maxlen=8))
     _var_history: object = field(default_factory=lambda: deque(maxlen=8))
-    _bpm_history: object = field(default_factory=lambda: deque(maxlen=15))  # Fix T: temporal
-    is_harmonic_suspect: bool = False   # Fix H: cross-ROI harmonic flag
-    # Priority 2D: auto-exclusion
-    _bad_streak: int = 0       # consecutive frames with SQI below threshold
-    _excluded_until: int = 0   # frame number until which this ROI is excluded
+    _bpm_history: object = field(default_factory=lambda: deque(maxlen=15))
+    is_harmonic_suspect: bool = False
+
+    _bad_streak: int = 0
+    _excluded_until: int = 0
 
     def clear(self):
         self.buf_r.clear(); self.buf_g.clear(); self.buf_b.clear()
@@ -123,13 +120,16 @@ class FrameResult:
     roi_agreement: float     = 1.0
     exposure_drift: float    = 0.0
     brightness_normalized: bool = False
-    in_calibration: bool     = False   # Fix #10
-    output_frozen: bool      = False   # Fix #6
-    n_valid_rois: int        = 0       # Fix 4/5: ROI count at fusion
-    bpm_locked: bool         = False  # True when temporal trust lock is active
+    in_calibration: bool     = False
+    output_frozen: bool      = False
+    n_valid_rois: int        = 0
+    bpm_locked: bool         = False
+    top3_peaks: list         = field(default_factory=list)
+    subharm_corrected: bool  = False
+    physio_state:    str          = "RESTING"
+    resp_rate_bpm:   float        = 0.0
+    cardiac_fraction: float       = 1.0
 
-
-# ─── Exposure compensator ─────────────────────────────────────────────────────
 
 class ExposureCompensator:
     def __init__(self, window: int = 90):
@@ -169,15 +169,9 @@ class ExposureCompensator:
             return signal
 
 
-# ─── Fix #3: BPM Smoother with Fix #2 plausibility ───────────────────────────
-
 class BPMSmoother:
-    """
-    Fix #3: Three-stage smoother at decision layer:
-      1. Physiological plausibility gate (Fix #2)
-      2. Sliding-median window
-      3. EMA -> Kalman
-    """
+
+
     def __init__(self, median_window: int = None, ema_alpha: float = None):
         self.median_window = median_window or cfg.BPM_MEDIAN_WINDOW
         self.ema_alpha     = ema_alpha     or cfg.BPM_EMA_ALPHA
@@ -186,13 +180,13 @@ class BPMSmoother:
         self._last_accepted: Optional[float] = None
         self.kalman = KalmanBPMFilter(q_bpm=0.1, q_vel=0.01, r_bpm=5.0)
         self._recent: deque = deque(maxlen=cfg.TEMPORAL_HISTORY_LEN)
-        # Priority 2: Temporal Trust Lock
+
         self._stable_history: deque = deque(maxlen=int(cfg.STABLE_LOCK_SECONDS * 30))
         self._is_locked: bool = False
         self._lock_center: float = 0.0
 
     def _is_physiologically_plausible(self, bpm: float) -> bool:
-        """Fix #2: Reject wild jumps even when ROI agreement looks good."""
+
         if len(self._recent) < 3:
             return True
         for prev in list(self._recent)[-3:]:
@@ -203,8 +197,21 @@ class BPMSmoother:
     def update(self, raw_bpm: float) -> float:
         if raw_bpm <= 0:
             return self.ema_val if self.ema_val else 0.0
+        
+
+
+        if self._last_accepted is not None:
+            alpha = cfg.TEMPORAL_INERTIA_ALPHA
+            raw_bpm = raw_bpm * alpha + self._last_accepted * (1.0 - alpha)
+            
+
+            delta = abs(raw_bpm - self._last_accepted)
+            if delta > cfg.MAX_BPM_JUMP:
+
+                raw_bpm = 0.1 * raw_bpm + 0.9 * self._last_accepted
+        
         self._recent.append(raw_bpm)
-        # Fix #2: physiological plausibility check
+
         if not self._is_physiologically_plausible(raw_bpm):
             if self.ema_val:
                 blended = 0.20 * raw_bpm + 0.80 * self.ema_val
@@ -212,7 +219,7 @@ class BPMSmoother:
                 raw_bpm = blended
             else:
                 return self.ema_val if self.ema_val else 0.0
-        # Bug3 fix: wider jump gate during warmup (first 150 updates), tighter after
+
         effective_jump = cfg.BPM_MAX_JUMP if len(self.raw_history) >= cfg.BPM_MEDIAN_WINDOW else cfg.BPM_MAX_JUMP * 2.5
         if self._last_accepted is not None:
             if abs(raw_bpm - self._last_accepted) > effective_jump:
@@ -220,18 +227,20 @@ class BPMSmoother:
                 return self.ema_val if self.ema_val else 0.0
         self._last_accepted = raw_bpm
         self.raw_history.append(raw_bpm)
-        # Fix #3a: sliding median
+
         median_bpm = float(np.median(self.raw_history))
-        # Fix #3b: EMA
+
+
+        alpha = cfg.BPM_EMA_ALPHA_RESEARCH
         if self.ema_val is None:
             self.ema_val = median_bpm
-        self.ema_val = self.ema_alpha * median_bpm + (1 - self.ema_alpha) * self.ema_val
-        # Rigorous Kalman Filter Update
+        self.ema_val = alpha * median_bpm + (1 - alpha) * self.ema_val
+
         final = self.kalman.update(self.ema_val, dt=1.0)
 
-        # Priority 2: Temporal Trust Lock
+
         self._stable_history.append(final)
-        # Bug6 fix: require raw_history full AND stable before locking
+
         min_frames_for_lock = int(cfg.STABLE_LOCK_SECONDS * 25)
         if (len(self._stable_history) >= min_frames_for_lock
                 and len(self.raw_history) >= self.median_window):
@@ -246,14 +255,18 @@ class BPMSmoother:
 
     def reset(self):
         self.raw_history.clear(); self.ema_val = None; self._last_accepted = None
-        self._kf_x = None; self._kf_p = 10.0; self._recent.clear()
-        self._stable_history.clear(); self._is_locked = False
 
+        if self._stable_history:
 
-# ─── Session Confidence Scorer ────────────────────────────────────────────────
+            keep_n = max(1, len(self._stable_history) // 5)
+            old_data = list(self._stable_history)[-keep_n:]
+            self._stable_history.clear()
+            for d in old_data: self._stable_history.append(d)
+        self._is_locked = False
+
 
 class SessionConfidenceScorer:
-    """Fix #7: confidence = SQI x consistency x agreement, NOT time accumulation."""
+
     def __init__(self, window: int = None):
         self.window = window or cfg.SESSION_CONF_CONSISTENCY_WINDOW
         self.sqi_samples = deque(maxlen=self.window)
@@ -261,6 +274,8 @@ class SessionConfidenceScorer:
         self.agreement_samples = deque(maxlen=self.window)
         self.motion_samples = deque(maxlen=self.window)
         self.confidence = 0.0
+
+        self.session_conf_ema = 0.0
 
     def update(self, sqi, bpm, is_moving, roi_agreement=1.0, n_valid_rois=1):
         if is_moving:
@@ -279,14 +294,14 @@ class SessionConfidenceScorer:
         mean_agr = float(np.mean(self.agreement_samples)) if self.agreement_samples else 1.0
         motion_ratio = float(np.mean(self.motion_samples))
 
-        # Consistency: low std in BPM = high confidence
+
         if len(self.bpm_samples) >= 5:
             bpm_std = float(np.std(self.bpm_samples))
             consistency = float(np.exp(-bpm_std / 10.0))
         else:
             consistency = 0.5
 
-        # Multi-ROI bonus
+
         roi_bonus = 1.0 if n_valid_rois >= 2 else 0.85
 
         raw_conf = (
@@ -295,9 +310,18 @@ class SessionConfidenceScorer:
             cfg.SESSION_CONF_WEIGHT_TEMPORAL  * consistency   +
             cfg.SESSION_CONF_WEIGHT_MOTION    * (1.0 - motion_ratio)
         )
-        # Hard multiplier: if agreement is low, confidence is capped
+
         agr_mult = max(cfg.SESSION_CONF_AGREEMENT_FLOOR, mean_agr)
-        self.confidence = float(np.clip(raw_conf * agr_mult * roi_bonus * 100.0, 0, 100))
+        instant_conf = float(np.clip(raw_conf * agr_mult * roi_bonus * 100.0, 0, 100))
+        
+
+        alpha = 0.02
+        if self.session_conf_ema == 0:
+            self.session_conf_ema = instant_conf
+        else:
+            self.session_conf_ema = alpha * instant_conf + (1 - alpha) * self.session_conf_ema
+            
+        self.confidence = self.session_conf_ema
 
     def get_confidence(self): return self.confidence
     @property
@@ -310,10 +334,8 @@ class SessionConfidenceScorer:
         self.agreement_samples.clear(); self.motion_samples.clear(); self.confidence = 0.0
 
 
-# ─── Calibration Phase ────────────────────────────────────────────────────────
-
 class CalibrationPhase:
-    """Fix #10: First N frames to establish baseline SQI and BPM."""
+
     def __init__(self, frames: int = None):
         self.target_frames = frames or cfg.CALIBRATION_FRAMES
         self.sqi_samples = []
@@ -337,8 +359,6 @@ class CalibrationPhase:
         self.sqi_samples = []; self.bpm_samples = []; self.done = False
 
 
-# ─── Skin Tone Calibrator ─────────────────────────────────────────────────────
-
 class SkinToneCalibrator:
     def __init__(self):
         self.r_history = deque(maxlen=150); self.g_history = deque(maxlen=150); self.b_history = deque(maxlen=150)
@@ -348,14 +368,14 @@ class SkinToneCalibrator:
         self.r_history.append(r); self.g_history.append(g); self.b_history.append(b)
         if len(self.g_history) >= 30:
             mr = np.mean(self.r_history); mg = np.mean(self.g_history); mb = np.mean(self.b_history)
-            # Normalize to green channel
+
             self.nf_r = mg / (mr + 1e-9); self.nf_b = mg / (mb + 1e-9)
 
     def get_normalization_factors(self): return self.nf_r, 1.0, self.nf_b
 
     def skin_type_label(self):
         if not self.g_history: return "UNKNOWN"
-        # Very rough heuristic based on brightness
+
         lum = (np.mean(self.r_history) + np.mean(self.g_history) + np.mean(self.b_history)) / 3.0
         if lum > 180: return "TYPE I-II"
         if lum > 120: return "TYPE III-IV"
@@ -366,31 +386,21 @@ class SkinToneCalibrator:
         self.nf_r = 1.0; self.nf_g = 1.0; self.nf_b = 1.0
 
 
-# ─── Motion Artifact Detector ─────────────────────────────────────────────────
-
 class MotionArtifactDetector:
-    """
-    Redesigned motion detector.
-    Root cause of "always 2.0": np.mean(absdiff) on raw pixels ≈ sensor noise floor.
-    Fix:
-      1. Pre-blur both frames to kill sensor noise
-      2. Use 85th-percentile of diff (not mean) – ignores noise, responds to real motion
-      3. Dual signal: pixel-diff + landmark displacement for robustness
-      4. EMA temporal smoothing over 5 frames
-      5. Thresholds tuned for percentile-based metric (not raw mean)
-    """
+
+
     def __init__(self):
         self.prev_gray     = None
-        self.prev_lm_pts   = None          # landmark positions prev frame
+        self.prev_lm_pts   = None
         self.motion_score  = 0.0
         self.is_moving     = False
         self.grace_counter = 0
-        self._score_ema    = 0.0           # EMA of raw score (fast, ~5-frame)
-        self._ema_alpha    = 0.35          # EMA smoothing
-        self._slow_ema     = 0.0           # FIX1-HPF: slow baseline tracker (breathing freq)
-        self._slow_alpha   = 0.04          # ~8s time constant @30fps → tracks respiration drift
-        self._prev_raw     = 0.0           # FIX1-HPF: previous raw score for HPF difference term
-        # Landmark anchor indices (stable, spread across face)
+        self._score_ema    = 0.0
+        self._ema_alpha    = 0.35
+        self._slow_ema     = 0.0
+        self._slow_alpha   = 0.04
+        self._prev_raw     = 0.0
+
         self._lm_ids = [1, 33, 263, 61, 291, 199, 168, 4, 234, 454, 10, 152]
 
     def update(self, gray, face_landmarks, h, w):
@@ -399,17 +409,17 @@ class MotionArtifactDetector:
             self.prev_lm_pts = None
             return 0.0, False
 
-        # ── Signal 1: landmark displacement (immune to lighting changes) ──────
+
         lm       = face_landmarks.landmark
         curr_pts = np.array([[lm[i].x * w, lm[i].y * h]
                               for i in self._lm_ids if i < len(lm)], dtype=np.float32)
         lm_score = 0.0
         if self.prev_lm_pts is not None and len(curr_pts) == len(self.prev_lm_pts):
             dists    = np.linalg.norm(curr_pts - self.prev_lm_pts, axis=1)
-            lm_score = float(np.median(dists))   # pixels of displacement
+            lm_score = float(np.median(dists))
         self.prev_lm_pts = curr_pts.copy()
 
-        # ── Signal 2: pixel diff on pre-blurred face crop ────────────────────
+
         lm_x = (curr_pts[:, 0] / w); lm_y = (curr_pts[:, 1] / h)
         x1 = max(0, int(lm_x.min() * w) - 10)
         y1 = max(0, int(lm_y.min() * h) - 10)
@@ -420,32 +430,27 @@ class MotionArtifactDetector:
             curr_crop = gray[y1:y2, x1:x2]
             prev_crop = self.prev_gray[y1:y2, x1:x2]
             if curr_crop.shape == prev_crop.shape and curr_crop.size > 0:
-                # Pre-blur kills sensor noise (3×3 Gaussian ≈ noise floor → 0)
+
                 curr_b = cv2.GaussianBlur(curr_crop, (3, 3), 0)
                 prev_b = cv2.GaussianBlur(prev_crop, (3, 3), 0)
                 diff   = cv2.absdiff(curr_b, prev_b)
-                # 85th percentile: ignores low-level noise, catches real motion edges
+
                 px_score = float(np.percentile(diff, 85))
         self.prev_gray = gray.copy()
 
-        # ── Combine: lm-gated formula – lighting changes can't fake motion ──────
-        # lm_score: noise<0.3px, small move>1px, head turn>5px
-        # px_score (p85 blurred): noise<1.5, lighting up to 10, real motion>8
-        # Key: px contribution is gated by lm stability → lighting alone = no trigger
-        lm_gate   = min(lm_score / 0.8, 1.0)   # 0=still, 1=moving (per landmarks)
+
+        lm_gate   = min(lm_score / 0.8, 1.0)
         raw_score = lm_score * 1.5 + px_score * 0.15 * lm_gate
 
-        # ── EMA temporal smoothing (5-frame) ──────────────────────────────────
+
         self._score_ema = self._ema_alpha * raw_score + (1 - self._ema_alpha) * self._score_ema
 
-        # ── FIX1-HPF: High-Pass Filter – removes slow breathing oscillation (∼0.2-0.4 Hz) ───
-        # slow_ema is a very long time-constant tracker (tau≈8s @30fps).
-        # HPF score = fast_ema – 0.6*slow_ema  → DC drift & respiration component cancelled.
+
         self._slow_ema = self._slow_alpha * raw_score + (1 - self._slow_alpha) * self._slow_ema
         hpf_score = max(0.0, self._score_ema - self._slow_ema * 0.6)
         self.motion_score = round(hpf_score, 3)
 
-        # ── Hysteresis with grace period ──────────────────────────────────────
+
         if self.motion_score > cfg.MOTION_ENTER_THRESHOLD:
             self.is_moving     = True
             self.grace_counter = cfg.MOTION_GRACE_FRAMES
@@ -464,20 +469,28 @@ class MotionArtifactDetector:
         self.is_moving     = False
         self.grace_counter = 0
         self._score_ema    = 0.0
-        self._slow_ema     = 0.0  # FIX1-HPF: reset baseline tracker
+        self._slow_ema     = 0.0
         self._prev_raw     = 0.0
 
 
-# ─── Core Signal Processing ───────────────────────────────────────────────────
+def bandpass_filter(data, fps, lowcut=0.833, highcut=3.0, order=4):
 
-def bandpass_filter(data, fps, lowcut=0.7, highcut=3.0, order=4):
+
     nyq = 0.5 * fps
     low = lowcut / nyq; high = highcut / nyq
-    b, a = butter(order, [low, high], btype='band')
-    return filtfilt(b, a, data)
+    sos = butter(order, [low, high], btype='band', output='sos')
+    return sosfilt(sos, data)
 
 def detrend(data):
-    return scipy_detrend(data, type='linear')
+
+
+    data = scipy_detrend(data, type='linear')
+
+    window = int(30 * 2)
+    if len(data) > window:
+        ma = np.convolve(data, np.ones(window)/window, mode='same')
+        data = data - ma
+    return data
 
 def chrom_rppg(r, g, b):
     r = np.array(r); g = np.array(g); b = np.array(b)
@@ -491,28 +504,135 @@ def pos_rppg(r, g, b):
     C = np.vstack([rn, gn, bn]); Pn = np.dot([0, 1, -1], C); S2 = np.dot([0, 1, 1], C)
     return Pn / (np.std(Pn) + 1e-9) - (np.std(Pn) / (np.std(S2) + 1e-9)) * (S2 / (np.std(S2) + 1e-9))
 
-def _pick_one_peak(fft_v, freqs, mask):
+def _pick_one_peak(fft_v, freqs, mask, prev_bpm=None):
+
+
     if not np.any(mask): return None
+    
+
     idxs, _ = find_peaks(fft_v, distance=3)
     idxs = [i for i in idxs if mask[i]]
-    if not idxs: return freqs[mask][np.argmax(fft_v[mask])]
-    idxs = sorted(idxs, key=lambda i: fft_v[i], reverse=True)[:3]
-    def _is_harm(fc, ff, tol=0.05):
-        return any(abs(fc - ff * r) / (ff * r + 1e-9) < tol
-                   for r in [2.0, 3.0, 0.5, 0.333, 1.5, 0.667])
-    for i, pidx in enumerate(idxs):
-        fc = freqs[pidx]
-        if not any(freqs[pidx2] < fc and _is_harm(fc, freqs[pidx2])
-                   for j, pidx2 in enumerate(idxs) if j != i):
-            return fc
-    return freqs[idxs[0]]
+    
+    if not idxs:
+        return freqs[mask][np.argmax(fft_v[mask])]
+    
+
+    top_idxs = sorted(idxs, key=lambda i: fft_v[i], reverse=True)[:5]
+    candidates = []
+    
+    for idx in top_idxs:
+        hz = freqs[idx]
+        bpm = hz * 60.0
+        power = fft_v[idx]
+        
+
+        score = power
+        
+        if prev_bpm is not None and prev_bpm > 0:
+
+
+            if abs(bpm - prev_bpm * 2) < cfg.HARMONIC_PROXIMITY_TOL:
+                score *= 0.4
+                
+
+            dist = abs(bpm - prev_bpm)
+            proximity = np.exp(-(dist**2) / (2 * 15.0**2))
+            score *= (0.5 + 0.5 * proximity)
+            
+
+            if dist > 30:
+                score *= 0.3
+        
+        candidates.append({'hz': hz, 'bpm': bpm, 'score': score, 'power': power, 'idx': idx})
+    
+
+    candidates = sorted(candidates, key=lambda x: x['score'], reverse=True)
+    
+
+
+    best = candidates[0]
+    if best['bpm'] > cfg.HARMONIC_BPM_THRESHOLD:
+        half_bpm = best['bpm'] / 2.0
+
+        for other in candidates[1:]:
+            if abs(other['bpm'] - half_bpm) < 5.0:
+
+                if len(candidates) > 1:
+
+                    for cand in candidates[1:]:
+                        if cand['bpm'] < cfg.HARMONIC_BPM_THRESHOLD or abs(cand['bpm'] - half_bpm) < 5.0:
+                            return cand['hz']
+    
+
+    for other in candidates[1:]:
+        if abs(best['bpm'] - 2 * other['bpm']) < 7.0:
+            if other['power'] > best['power'] * 0.3:
+                return other['hz']
+                
+    return best['hz']
 
 _peak_freq_history = {}
+
+def _get_top3_peaks_debug(fft_v, freqs, mask):
+
+
+    idxs, _ = find_peaks(fft_v, distance=3)
+    band_idxs = [i for i in idxs if mask[i]]
+    if not band_idxs:
+        band_idxs = list(np.where(mask)[0])
+    top3 = sorted(band_idxs, key=lambda i: fft_v[i], reverse=True)[:3]
+    return [(round(freqs[i] * 60.0, 1), round(float(fft_v[i]), 4)) for i in top3]
+
+
+def _resolve_subharmonic(fft_v, freqs, mask, candidate_hz, prev_bpm=None):
+
+
+    if candidate_hz <= 0:
+        return candidate_hz, False
+
+    freq_high = freqs[mask].max() if np.any(mask) else 3.0
+    bpm_cand = candidate_hz * 60.0
+
+    def _band_energy(center_hz, half_bw=0.12):
+        near = (freqs >= center_hz - half_bw) & (freqs <= center_hz + half_bw) & mask
+        return float(fft_v[near].sum()) if np.any(near) else 0.0
+
+    e_cand = _band_energy(candidate_hz)
+    if e_cand < 1e-12:
+        return candidate_hz, False
+
+
+    sub_h = candidate_hz / 2.0
+    if sub_h >= FREQ_LOW:
+        e_sub = _band_energy(sub_h)
+
+        ratio_thresh = cfg.HARMONIC_SNR_RATIO
+        if prev_bpm is not None and prev_bpm < 90 and bpm_cand > 130:
+            ratio_thresh *= 0.5
+            
+        if e_sub >= e_cand * ratio_thresh:
+            return sub_h, True
+
+
+    if candidate_hz < 1.25:
+        double_hz = candidate_hz * 2.0
+        if double_hz <= freq_high:
+            e_double = _band_energy(double_hz)
+
+            promo_thresh = 0.40
+            if prev_bpm is not None and prev_bpm > 80 and bpm_cand < 60:
+                promo_thresh = 0.25
+                
+            if e_double >= e_cand * promo_thresh:
+                return double_hz, True
+
+    return candidate_hz, False
+
 
 def estimate_bpm_fft(signal, fps, roi_name: str = ""):
     n = len(signal)
     if n < 30: return 0.0, np.array([]), np.array([]), {}
-    # Anti-leakage windowing
+
     win_signal = apply_windowing(signal, window_type='hann')
     fft_v_full = np.abs(np.fft.rfft(win_signal))
     freqs_full  = np.fft.rfftfreq(n, d=1.0 / fps)
@@ -551,7 +671,19 @@ def estimate_bpm_fft(signal, fps, roi_name: str = ""):
                     hist_votes = sum(1 for c in candidates if abs(c - hist_med) < cfg.FFT_WINDOW_VOTE_TOL)
                     new_votes  = sum(1 for c in candidates if abs(c - peak_hz) < cfg.FFT_WINDOW_VOTE_TOL)
                     if hist_votes >= new_votes: peak_hz = hist_med
+
+
+        bpm_jump = abs(peak_hz - float(np.median(hist))) * 60.0 if len(hist) >= 3 else 0.0
+        if bpm_jump > 15.0:
+            fft_consistency *= 0.5
         _peak_freq_history[roi_name].append(peak_hz)
+
+    peak_hz, was_subharm = _resolve_subharmonic(fft_v_full, freqs_full, mask_full, peak_hz)
+    if was_subharm and roi_name:
+
+        if roi_name in _peak_freq_history:
+            _peak_freq_history[roi_name].append(peak_hz)
+
     peak_bpm = peak_hz * 60.0
     fft_m_disp = fft_v_full.copy(); fft_m_disp[~mask_full] = 0.0
     near = (freqs_full >= peak_hz - 0.10) & (freqs_full <= peak_hz + 0.10)
@@ -563,17 +695,20 @@ def estimate_bpm_fft(signal, fps, roi_name: str = ""):
         while ri < len(fft_m_disp) - 1 and fft_m_disp[ri] > hp: ri += 1
         width_ok = (ri - li) <= 5
     else: dom = 0.0; width_ok = True
+    top3 = _get_top3_peaks_debug(fft_v_full, freqs_full, mask_full)
     vi = {
         "dominance": round(dom, 3), "peak_dominance": round(dom, 3), "dominant": dom >= 0.12,
         "peak_width_ok": width_ok, "harmonic_rejected": any(abs(c * 2 - peak_hz) < 0.12 for c in candidates if abs(c - peak_hz) > 0.05) if candidates else False,
         "fft_consistency": round(fft_consistency, 3), "n_windows": len(candidates),
         "is_harmonic": mature_harmonic_rejection(fft_v_full, freqs_full, peak_hz),
-        "resp_interference": respiratory_interference_analysis(signal, fps)
+        "resp_interference": respiratory_interference_analysis(signal, fps),
+
+        "top3_peaks": top3,
+        "subharm_corrected": was_subharm,
+        "bpm_jump_bpm": round(bpm_jump if roi_name else 0.0, 1),
     }
     return peak_bpm, freqs_full, fft_v_full, vi
 
-
-# ─── Fix #4: SQI with rebalanced weights + capped penalties ──────────────────
 
 def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
                 roi_brightness=-1.0, fft_validation=None, prev_sqi=-1.0,
@@ -582,6 +717,17 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
                "lighting_penalty":0.0,"fft_penalty":0.0,"overall":0.0,
                "temporal_stability": 0.0, "peak_consistency": 0.0}
     if len(signal)<30 or peak_bpm<=0: return 0.0, breakdown
+
+
+    bio_penalty = 1.0
+    if peak_bpm > 140 and motion_score < 1.0:
+        bio_penalty = 0.5
+    
+
+    if roi_obj is not None and hasattr(roi_obj, '_bpm_history') and len(roi_obj._bpm_history) >= 5:
+        bpm_std = np.std(list(roi_obj._bpm_history))
+        if bpm_std > 15.0:
+            bio_penalty *= 0.5
 
     sig=signal-np.mean(signal); sig=scipy_detrend(sig,type="linear")
     n=len(sig); fft_v=np.abs(np.fft.rfft(sig*np.hanning(n)))**2
@@ -605,8 +751,9 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
     if power_peak>1e-9:
         snr_score=min(snr_score+min((power_harm2/(power_peak+1e-9))*0.10,0.10),1.0)
 
+
     sig_norm=(sig-sig.mean())/(sig.std()+1e-9)
-    peaks,_=find_peaks(sig_norm,distance=int(fps*0.50),prominence=0.35,height=0.1)
+    peaks,_=find_peaks(sig_norm,distance=int(fps*0.50),prominence=cfg.PEAK_PROMINENCE_MIN,height=0.1)
     if len(peaks)>=3:
         intervals=np.diff(peaks); cv=np.std(intervals)/(np.mean(intervals)+1e-9)
         reg_raw=max(0.0,1.0-cv*1.5)
@@ -628,7 +775,19 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
         roi_obj._var_history.append(var_raw); var_score=float(np.mean(roi_obj._var_history))
     else: var_score=var_raw
 
-    # 🥇 Fix 1: FFT penalty (Non-linear & less aggressive)
+
+    if fft_validation and "top3_peaks" in fft_validation:
+        top3 = fft_validation["top3_peaks"]
+        if len(top3) >= 2:
+            p1_power = top3[0][1]
+            p2_power = top3[1][1]
+            peak_ratio = p1_power / (p2_power + 1e-9)
+            if peak_ratio < cfg.PEAK_DOMINANCE_RATIO_MIN:
+
+                if "fft_penalty" not in locals(): fft_penalty = 0.0
+                fft_penalty += 0.2
+
+
     fft_penalty=0.0
     if fft_validation:
         dom = fft_validation.get("dominance", 0.15)
@@ -643,19 +802,33 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
             extra_pen = ((1.0 - consistency) ** 0.5) * 0.10
             fft_penalty = min(fft_penalty + extra_pen, cfg.SQI_MAX_FFT_PENALTY)
 
-    # 🥈 Fix 2: Rebalance SQI formula & 🥉 Fix 3: Temporal Stability
-    temp_stability = 1.0
+
+    prev_stability = getattr(roi_obj, "_prev_stability", 1.0) if roi_obj else 1.0
+    
+    current_inst_stability = 1.0
     if roi_obj is not None and len(roi_obj._bpm_history) >= 5:
         hist = list(roi_obj._bpm_history); bpm_std = np.std(hist); bpm_mean = np.mean(hist)
-        temp_stability = max(0.0, 1.0 - (bpm_std / (bpm_mean + 1e-9)) * 5.0)
+        current_inst_stability = max(0.0, 1.0 - (bpm_std / (bpm_mean + 1e-9)) * 5.0)
     
-    peak_consistency = fft_validation.get("fft_consistency", 0.5) if fft_validation else 0.5
+
+    temp_stability = prev_stability * 0.9 + current_inst_stability * 0.1
+    if roi_obj: roi_obj._prev_stability = temp_stability
+
+
+    current_peak_consistency = fft_validation.get("fft_consistency", 0.5) if fft_validation else 0.5
+    prev_peak_consistency = getattr(roi_obj, "_prev_peak_consistency", 0.5) if roi_obj else 0.5
+    peak_consistency = prev_peak_consistency * 0.8 + current_peak_consistency * 0.2
+    if roi_obj: roi_obj._prev_peak_consistency = peak_consistency
+
 
     motion_penalty=0.0
-    # Fix2: threshold raised to match redesigned motion metric (noise floor ~0.3, real motion >2.0)
-    # FIX3: threshold raised to 2.0 (breathing/tremor lives at 0.5-1.5, must not be penalised).
-    # Penalty ramps gradually via linear scale /8.0 (was /6.0) → gentler curve below 2.8 enter.
-    if motion_score > 2.0: motion_penalty = min((motion_score - 2.0) / 8.0, cfg.SQI_MAX_MOTION_PENALTY)
+
+
+    if motion_score > 2.0: 
+        motion_penalty = min((motion_score - 2.0) / 8.0, cfg.SQI_MAX_MOTION_PENALTY)
+
+        if hasattr(roi_obj, 'motion_penalty'):
+            motion_penalty *= (2.0 - roi_obj.motion_penalty)
 
     bref=roi_brightness if roi_brightness>=0 else mean_brightness
     lighting_penalty=0.0
@@ -685,7 +858,7 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
             consensus_pen = (0.7 - af) / 0.7 * 0.30
             raw *= (1.0 - consensus_pen)
             
-    overall=raw*100.0
+    overall=raw*100.0 * bio_penalty
     if prev_sqi>0: overall=0.40*prev_sqi+0.60*overall
     overall=round(min(100.0,max(0.0,overall)),1)
     
@@ -714,14 +887,11 @@ def get_roi_polygon_masked(frame, face_landmarks, landmark_ids, h, w):
     return pts_arr, mean_r, mean_g, mean_b, (x1,y1,x2,y2), roi_brightness
 
 
-# ─── Fix #1 + #6: Dynamic weight with hard dominance ─────────────────────────
-
 def compute_dynamic_roi_weight(roi, base_weight, motion_score, exposure_drift=0.0):
-    """🧠 Fix 5: Dynamic Trust System"""
+
     snr_val=roi.roi_snr
-    # FIX3: Continuous exponential weighting replaces binary kill switch.
-    # exp(-k*(thresh-snr)/thresh) gives near-zero weight far below threshold,
-    # 1.0 well above it, and smooth curve in between – no cliff edge.
+
+
     if snr_val < cfg.SNR_KILL_THRESHOLD:
         snr_score = cfg.SNR_KILL_WEIGHT + (1.0 - cfg.SNR_KILL_WEIGHT) * np.exp(-3.0 * (cfg.SNR_KILL_THRESHOLD - snr_val) / (cfg.SNR_KILL_THRESHOLD + 1e-9))
     else: snr_score = min((snr_val / 100.0) ** 1.5, 1.0)
@@ -729,20 +899,61 @@ def compute_dynamic_roi_weight(roi, base_weight, motion_score, exposure_drift=0.
     if len(roi._bpm_history) >= 5:
         bpm_std = np.std(roi._bpm_history); temp_stab = max(0.1, 1.0 - (bpm_std / 10.0))
     af = roi.agreement_factor
-    # FIX3: Continuous exponential weighting for agreement (same pattern as SNR above).
+
     if af < cfg.AGREEMENT_KILL_BELOW:
         agr_score = cfg.AGREEMENT_KILL_MULT + (af / (cfg.AGREEMENT_KILL_BELOW + 1e-9)) * (cfg.AGREEMENT_KILL_BELOW - cfg.AGREEMENT_KILL_MULT)
     else: agr_score = af
-    trust_score = 0.5 * snr_score + 0.3 * temp_stab + 0.2 * agr_score
-    weight = base_weight * trust_score
-    if motion_score > 3.5: weight *= 0.5   # Fix3: raised to match new metric
+
+
+    history_score = temp_stab
+    dyn_weight_factor = (snr_score * 0.5 + agr_score * 0.3 + history_score * 0.2)
+    
+    weight = base_weight * dyn_weight_factor
+
+    
+
+
+    if af < cfg.AGREEMENT_KILL_BELOW:
+        weight *= cfg.ROI_BRUTAL_PENALTY
+    if motion_score > 3.5: weight *= 0.5
     if exposure_drift > cfg.EXPOSURE_DRIFT_FREEZE: weight *= 0.1
     elif exposure_drift > cfg.EXPOSURE_DRIFT_WARN: weight *= cfg.EXPOSURE_DRIFT_WEIGHT_MULT
     return float(np.clip(weight, cfg.DYN_WEIGHT_MIN, cfg.DYN_WEIGHT_MAX))
 
 
 def cross_roi_harmonic_check(rois_dict):
+
+
     if not rois_dict: return
+    
+
+    roi_list = list(rois_dict.values())
+    for i in range(len(roi_list)):
+        for j in range(len(roi_list)):
+            if i == j: continue
+            roi_a, roi_b = roi_list[i], roi_list[j]
+            if roi_b.bpm <= 0: continue
+            
+            ratio = roi_a.bpm / roi_b.bpm
+
+            if 1.85 < ratio < 2.15:
+
+
+                if roi_b.sqi > 45:
+
+
+                    penalty = 0.2 if roi_b.sqi > 70 else 0.5
+                    
+
+                    if getattr(roi_b, "_prev_stability", 0.5) > 0.8:
+                        penalty *= 0.5
+                        
+                    roi_a.dynamic_weight *= penalty
+                    roi_a.agreement_factor *= 0.1
+                    roi_a.sqi *= penalty
+
+                
+
     ref_roi = max(rois_dict.values(), key=lambda r: r.sqi)
     ref_bpm = ref_roi.bpm; harmonic_ratios = [2.0, 3.0, 0.5, 0.333]; tol_ratio = 0.08
     for name, roi in rois_dict.items():
@@ -752,7 +963,7 @@ def cross_roi_harmonic_check(rois_dict):
         if abs(roi.bpm - ref_bpm * 2.0) < ref_bpm * 0.15: is_suspect = True
         if abs(roi.bpm - ref_bpm * 0.5) < ref_bpm * 0.08: is_suspect = True
         if abs(roi.bpm - ref_bpm) < 6.0: is_suspect = False
-        roi.is_harmonic_suspect = is_suspect
+        roi.is_harmonic_suspect = is_suspect or getattr(roi, 'is_harmonic_suspect', False)
 
 
 def _cluster_rois(roi_items):
@@ -797,19 +1008,40 @@ def hierarchical_fusion(roi_items, min_cluster_weight_frac=None):
     total_w = sum(r[1] for r in results); return sum(r[0]*r[1] for r in results)/total_w
 
 
-# ─── Main fusion engine V1 ─────────────────────────────────────────────────────
+class BPMMedianStabilizer:
+
+
+    def __init__(self, window: int = 10):
+        self._history: deque = deque(maxlen=window)
+
+    def update(self, bpm: float) -> float:
+        if bpm > 0:
+            self._history.append(bpm)
+        if len(self._history) < 3:
+            return bpm
+        return float(np.median(self._history))
+
+    def reset(self):
+        self._history.clear()
 
 class MultiROIFusionEngine:
     def __init__(self):
         self.rois = {name: ROISignal(name=name) for name in ROI_CONFIGS}
         self.skin_calibrator = SkinToneCalibrator(); self.motion_detector = MotionArtifactDetector()
-        self.exposure_comp = ExposureCompensator(); self.bpm_smoother = BPMSmoother()
+        self.exposure_comp = ExposureCompensator(); self.bpm_smoother = BPMSmoother(); self.bpm_median_stab = BPMMedianStabilizer(window=10)
         self.session_scorer = SessionConfidenceScorer(); self.calibration = CalibrationPhase()
         self.prob_fusion = ProbabilisticFusion()
         self.calibrated_sqi = StatisticallyCalibratedSQI()
         self.learned_weighting = LearnedWeighting(ROI_CONFIGS.keys())
         self.uncertainty_engine = UncertaintyAwareConfidence()
         self.roi_manager = AdaptiveROIManager()
+
+        self.physio_classifier = PhysiologicalStateClassifier()
+        self.panting_adapter   = PantingAdaptiveHR()
+
+        self._flow_stab = {n: OpticalFlowROIStabilizer() for n in ROI_CONFIGS}
+
+        self._pulse_sel = {n: PulseRichPixelSelector() for n in ROI_CONFIGS}
         self.protocol = ReproducibilityProtocol()
         self.fps_buffer = deque(maxlen=30); self.bpm_history = deque(maxlen=12)
         self.prev_time = time.time(); self.frame_count = 0; self.MIN_FRAMES = cfg.MIN_FRAMES; self._frozen_bpm = 0.0
@@ -826,7 +1058,7 @@ class MultiROIFusionEngine:
             result.output_frozen=True; result.fused_bpm=self._frozen_bpm; result.roi_signals={k:v for k,v in self.rois.items()}; return result
         if face_landmarks is None: return result
         nf_r,nf_g,nf_b=self.skin_calibrator.get_normalization_factors()
-        # Adaptive ROI & Skin Segmentation
+
         self.roi_manager.segment_skin(frame)
         
         for roi_name,cfg_roi in ROI_CONFIGS.items():
@@ -836,7 +1068,7 @@ class MultiROIFusionEngine:
             if out is None: roi.valid=False; continue
             mr, mg, mb, refined_mask = out
             roi.valid=True; roi.roi_brightness=float(np.mean([mr, mg, mb]))
-            # Update ROI metadata for legacy compatibility
+
             roi.skin_coverage = cv2.countNonZero(refined_mask) / (refined_mask.size + 1e-9)
             if not is_moving and roi.roi_brightness<=220 and roi.roi_brightness>=40:
                 roi.buf_r.append(mr*nf_r); roi.buf_g.append(mg*nf_g); roi.buf_b.append(mb*nf_b); self.skin_calibrator.update(mr,mg,mb)
@@ -846,9 +1078,12 @@ class MultiROIFusionEngine:
         for k,v in self.rois.items():
             if not v.valid or len(v.buf_g)<self.MIN_FRAMES: continue
             if v._excluded_until > self.frame_count: continue
-            if v.skin_coverage<0.20: continue  # v12: lowered from 0.55
+
+
+            _sc_min = 0.10 if k.startswith("cheek") else 0.18
+            if v.skin_coverage < _sc_min: continue
             if v.roi_brightness<cfg.ROI_BRIGHTNESS_MIN or v.roi_brightness>cfg.ROI_BRIGHTNESS_MAX: continue
-            # v12: SNR gate removed; regularity gate disabled (REGULARITY_HARD_GATE=0)
+
             if v.bpm>0 and not (cfg.BPM_PLAUSIBLE_LOW<=v.bpm<=cfg.BPM_PLAUSIBLE_HIGH): continue
             valid_rois[k]=v
         if not valid_rois: result.roi_signals={k:v for k,v in self.rois.items()}; return result
@@ -856,7 +1091,7 @@ class MultiROIFusionEngine:
             arr_r=np.array(roi.buf_r); arr_g=np.array(roi.buf_g); arr_b=np.array(roi.buf_b)
             try:
                 if motion_score<=self.motion_detector.enter_threshold:
-                    # Standardized Algorithm Pipeline
+
                     algo_name = getattr(cfg, "RPPG_ALGO", "POS")
                     extractor = get_algorithm_by_name(algo_name)
                     sc = extractor(arr_r, arr_g, arr_b)
@@ -866,17 +1101,39 @@ class MultiROIFusionEngine:
                     sig_filt = bandpass_filter(sc, fps)
                     _std=float(np.std(sig_filt))
                     if _std>1e-8: sig_filt=(sig_filt-np.mean(sig_filt))/_std
+
+
+                    reg_history = list(roi._reg_history)
+                    if len(reg_history) >= 90 and np.mean(reg_history[-90:]) < 0.05:
+                        roi.valid = False
+                        roi._excluded_until = self.frame_count + cfg.ROI_REHAB_FRAMES
+                        continue
+
                     bpm_raw,freqs,power,fft_val=estimate_bpm_fft(sig_filt,fps,roi_name=roi_name)
-                    # Statistically Calibrated SQI
+
                     sqi_cal, sqi_meta = self.calibrated_sqi.calculate_sqi(sig_filt, fps, bpm_raw)
                     
-                    # Hybrid SQI (Legacy + Calibrated)
                     sqi_legacy, breakdown = compute_sqi(sig_filt,fps,bpm_raw,motion_score=motion_score,mean_brightness=result.frame_brightness,roi_brightness=roi.roi_brightness,fft_validation=fft_val,prev_sqi=roi.sqi,roi_obj=roi,exposure_drift=result.exposure_drift)
                     
-                    # Mature Harmonic & Respiratory Rejection
+
+
+                    for bad_bpm in cfg.BAD_FREQS_BPM:
+                        if abs(bpm_raw - bad_bpm) < 3:
+                            sqi_cal *= 0.5
+
+
                     if fft_val.get("is_harmonic", False): sqi_cal *= 0.5
                     resp_ratio = fft_val.get("resp_interference", 0.0)
-                    if resp_ratio > 2.0: sqi_cal *= 0.7 # Heavy respiratory interference
+
+
+                    _state_str = getattr(result, 'physio_state', 'RESTING')
+                    if resp_ratio > 2.0:
+                        if _state_str == 'PANTING':
+
+                            _cf = getattr(result, 'cardiac_fraction', 0.5)
+                            sqi_cal *= max(0.5, _cf)
+                        else:
+                            sqi_cal *= 0.7
                     
                     sqi = 0.5 * sqi_cal + 0.5 * sqi_legacy
                     roi.bpm=bpm_raw; roi.sqi=sqi; roi.roi_snr=sqi_meta.get("snr_db", 0.0); roi.roi_regularity=sqi_meta.get("spectral_entropy", 0.0)
@@ -891,49 +1148,119 @@ class MultiROIFusionEngine:
                 roi.sqi = 0.0
                 _rppg_warn(f'ROI processing (frame {getattr(self,"frame_count",0)})', _exc)
         best_sqi=max((r.sqi for r in valid_rois.values()),default=0.0); best_bpm=max((r.bpm for r in valid_rois.values() if BPM_LOW<=r.bpm<=BPM_HIGH),default=0.0)
+
+        _chrom_sig = next((list(v.buf_g)[-cfg.BUFFER_SIZE:] for v in valid_rois.values() if len(v.buf_g)>=30), [])
+        if len(_chrom_sig) >= 30:
+            _roi_sigs = {k: np.array(list(v.buf_g)[-cfg.BUFFER_SIZE:]) for k,v in valid_rois.items() if len(v.buf_g)>=30}
+            _physio = self.physio_classifier.update(np.array(_chrom_sig), fps, motion_score, _roi_sigs)
+            result.physio_state    = _physio.state.value
+            result.resp_rate_bpm   = _physio.resp_rate_bpm
+            result.cardiac_fraction = _physio.cardiac_fraction
+            self.panting_adapter.update(best_bpm, _physio.state)
         result.in_calibration=self.calibration.update(best_sqi,best_bpm)
-        # v12: try with SQI gate first, fallback to best available ROI
+
         candidates = {k: v for k, v in valid_rois.items() if BPM_LOW <= v.bpm <= BPM_HIGH and v.sqi >= SQI_HARD_GATE}
         if not candidates:
-            # Fallback: use any ROI with valid BPM regardless of SQI (show something)
+
             candidates = {k: v for k, v in valid_rois.items() if BPM_LOW <= v.bpm <= BPM_HIGH}
         if not candidates: result.roi_signals={k:v for k,v in self.rois.items()}; return result
         ref_roi = max(candidates.values(), key=lambda r: r.sqi); ref_bpm = ref_roi.bpm
         HARD_OUTLIER = cfg.FUSION_OUTLIER_THRESHOLD + 10.0; candidates = {k: v for k, v in candidates.items() if abs(v.bpm - ref_bpm) <= HARD_OUTLIER}
         if not candidates: candidates = {ref_roi.name: ref_roi}
+
+
+        candidate_bpms = [r.bpm for r in candidates.values()]
+        median_bpm = float(np.median(candidate_bpms))
+        
         for roi in candidates.values():
-            dev = abs(roi.bpm - ref_bpm); roi.agreement_factor = float(np.exp(-dev / cfg.AGREEMENT_DEV_K))
+            dev = abs(roi.bpm - ref_bpm)
+            roi.agreement_factor = float(np.exp(-dev / cfg.AGREEMENT_DEV_K))
+            
+
+            if abs(roi.bpm - median_bpm) > cfg.ROI_CONSENSUS_THRESHOLD:
+
+                roi.dynamic_weight *= cfg.ROI_BRUTAL_PENALTY
+                roi.agreement_factor *= 0.1
+        
         accepted = {k: v for k, v in candidates.items() if v.agreement_factor >= cfg.ROI_MIN_AGREEMENT_FACTOR}
         if not accepted:
             accepted = {k: v for k, v in valid_rois.items() if v is ref_roi}
             if not accepted: result.roi_signals={k:v for k,v in self.rois.items()}; return result
         accepted_bpms = [r.bpm for r in accepted.values()]
-        result.roi_agreement = float(np.exp(-np.std(accepted_bpms) / cfg.AGREEMENT_STD_K)) if len(accepted_bpms) >= 2 else 0.80
+        
+
+
+        bpm_std = np.std(accepted_bpms) if len(accepted_bpms) >= 2 else 0.0
+        if bpm_std > cfg.CONSENSUS_STD_MAX:
+
+            result.fused_bpm = 0.0
+            result.fused_sqi *= 0.2
+            result.roi_signals = {k: v for k, v in self.rois.items()}
+            return result
+
+        result.roi_agreement = float(np.exp(-bpm_std / cfg.AGREEMENT_STD_K)) if len(accepted_bpms) >= 2 else 0.80
         if len(accepted) > 2: accepted = dict(sorted(accepted.items(), key=lambda x: x[1].sqi, reverse=True)[:2])
         cross_roi_harmonic_check(accepted); roi_items=[]
         for roi_name,roi in accepted.items():
             w=compute_dynamic_roi_weight(roi,ROI_CONFIGS[roi_name]["base_weight"],motion_score,result.exposure_drift); roi.dynamic_weight=w; roi_items.append((roi_name,roi,w))
-        # Learned Weighting Adjustment
+
+
         learned_weights = self.learned_weighting.get_weights()
+        
+
         roi_items_learned = []
         for name, roi, w in roi_items:
             lw = learned_weights.get(name, 1.0)
-            roi_items_learned.append((name, roi, w * lw))
+
+            trust_score = lw * roi.sqi
+            roi_items_learned.append((name, roi, w * lw, trust_score))
+            
+
+        roi_items_learned = sorted(roi_items_learned, key=lambda x: x[3], reverse=True)
         
-        # Explicit Probabilistic Fusion
-        roi_data = [(r.bpm, r.sqi) for _, r, _ in roi_items_learned]
+
+        if len(roi_items_learned) >= 2:
+            if roi_items_learned[0][3] > roi_items_learned[1][3] * 1.5:
+
+                name0, roi0, w0, ts0 = roi_items_learned[0]
+                roi_items_learned[0] = (name0, roi0, w0 * 1.5, ts0)
+        
+
+        roi_items_final = [(n, r, w) for n, r, w, ts in roi_items_learned]
+        
+
+        roi_data = [(r.bpm, r.sqi) for _, r, _ in roi_items_final]
         fused_bpm_prob = self.prob_fusion.fuse(roi_data)
         
-        # Fallback/Hybrid with hierarchical
-        fused_bpm_hier = hierarchical_fusion(roi_items_learned)
+
+        fused_bpm_hier = hierarchical_fusion(roi_items_final)
         fused_bpm_raw = 0.7 * fused_bpm_prob + 0.3 * fused_bpm_hier
         
-        # Update Learned Weights
-        roi_sqis = {n: r.sqi for n, r, _ in roi_items_learned}
-        roi_bpms = {n: r.bpm for n, r, _ in roi_items_learned}
+
+        roi_sqis = {n: r.sqi for n, r, _ in roi_items_final}
+        roi_bpms = {n: r.bpm for n, r, _ in roi_items_final}
         self.learned_weighting.update_weights(roi_sqis, fused_bpm_raw, roi_bpms)
-        if fused_bpm_raw>0:
-            smoothed=self.bpm_smoother.update(fused_bpm_raw); result.fused_bpm=smoothed; self._frozen_bpm=smoothed
+
+
+        is_absurd = not (BPM_LOW <= fused_bpm_raw <= BPM_HIGH)
+        is_weak = result.fused_sqi < SQI_HARD_GATE
+        is_disagree = result.roi_agreement < 0.4
+        
+
+
+        if result.fused_sqi < cfg.SQI_DISPLAY_GATE or is_disagree:
+            result.fused_bpm = 0.0
+            result.bpm_locked = False
+        elif (is_absurd or is_weak) and self._frozen_bpm > 0:
+
+            result.fused_bpm = self._frozen_bpm
+            result.bpm_locked = True
+        elif fused_bpm_raw > 0:
+            smoothed=self.bpm_smoother.update(fused_bpm_raw); stabilized=self.bpm_median_stab.update(smoothed); result.fused_bpm=stabilized; self._frozen_bpm=stabilized
+
+            _best_roi = max(accepted.values(), key=lambda r: r.sqi)
+            result.top3_peaks = getattr(_best_roi, '_top3_peaks', [])
+            result.subharm_corrected = getattr(_best_roi, '_subharm', False)
             sqi_w_sum=sum(compute_dynamic_roi_weight(r,ROI_CONFIGS[n]["base_weight"],motion_score,result.exposure_drift)*r.sqi for n,r in accepted.items() if r.sqi>0)
             sqi_w_den=sum(compute_dynamic_roi_weight(r,ROI_CONFIGS[n]["base_weight"],motion_score,result.exposure_drift) for n,r in accepted.items() if r.sqi>0)
             result.fused_sqi=sqi_w_sum/sqi_w_den if sqi_w_den>0 else 0.0
@@ -945,7 +1272,7 @@ class MultiROIFusionEngine:
             if sigs: result.chrom_signal=max(sigs,key=lambda x:x[1])[0]
         self.session_scorer.update(result.fused_sqi,result.fused_bpm,is_moving,roi_agreement=result.roi_agreement,n_valid_rois=getattr(result,'n_valid_rois',1))
         
-        # Uncertainty-Aware Confidence
+
         self.uncertainty_engine.update(result.fused_bpm, result.fused_sqi, result.roi_agreement)
         conf, meta = self.uncertainty_engine.get_confidence_metrics()
         result.session_confidence = conf
@@ -955,10 +1282,7 @@ class MultiROIFusionEngine:
 
     def reset(self):
         for roi in self.rois.values(): roi.clear()
-        self.bpm_history.clear(); self.fps_buffer.clear(); self.bpm_smoother.reset(); self.session_scorer.reset(); self.motion_detector.reset(); self.calibration.reset(); self.exposure_comp.brightness_hist.clear(); self.exposure_comp.drift=0.0; self.frame_count=0; self.prev_time=time.time(); self._frozen_bpm=0.0
-
-
-# ─── Skin / quality helpers ───────────────────────────────────────────────────
+        self.bpm_history.clear(); self.fps_buffer.clear(); self.bpm_smoother.reset(); self.bpm_median_stab.reset(); self.session_scorer.reset(); self.motion_detector.reset(); self.calibration.reset(); self.exposure_comp.brightness_hist.clear(); self.exposure_comp.drift=0.0; self.frame_count=0; self.prev_time=time.time(); self._frozen_bpm=0.0
 
 class SkinConfidenceMap:
     YCRCB_CR_LO,YCRCB_CR_HI=125,185; YCRCB_CB_LO,YCRCB_CB_HI=70,140; HSV_S_LO,HSV_S_HI=15,220; HSV_V_LO,HSV_V_HI=50,255
@@ -976,6 +1300,7 @@ class PerPixelQualityFilter:
     def __init__(self,max_saturation=200,min_luminance=40,max_luminance=235):
         self.max_saturation=max_saturation; self.min_luminance=min_luminance; self.max_luminance=max_luminance; self._roi_history={}; self._hist_len=8
     _CANONICAL_H=32; _CANONICAL_W=32
+
     def filter_roi(self,roi_bgr,roi_name="default"):
         if roi_bgr is None or roi_bgr.size==0 or roi_bgr.shape[0]<4 or roi_bgr.shape[1]<4: return 0.0,0.0,0.0,0.0,None
         h,w=roi_bgr.shape[:2]; hsv=cv2.cvtColor(roi_bgr,cv2.COLOR_BGR2HSV); S=hsv[:,:,1].astype(np.float32); V=hsv[:,:,2].astype(np.float32)
@@ -1129,8 +1454,6 @@ class ReproducibilityLogger:
     def clear(self): self._raw_log.clear(); self._sqi_log.clear(); self._event_log.clear()
 
 
-# ─── V2 Engine: inherits updated V1, adds all advanced subsystems ─────────────
-
 class MultiROIFusionEngineV2(MultiROIFusionEngine):
     def __init__(self,enable_logging=False):
         super().__init__(); self.skin_map=SkinConfidenceMap(); self.pixel_filter=PerPixelQualityFilter(); self.micro_motion=ROIMicroMotionDetector(); self.arbitrator=MethodArbitrator(); self.resampler=TimestampResampler(target_fps=30.0); self.conf_trend=RollingConfidenceTrend(window_sec=20); self.resp_suppressor=RespiratoryArtifactSuppressor(); self.pose_gate=HeadPoseGate(); self.jaw_suppressor=JawBlinkSuppressor(); self.repro_logger=ReproducibilityLogger() if enable_logging else None; self.enable_logging=enable_logging; self._last_jaw_result={}; self._last_pose=(0.0,0.0,True)
@@ -1149,26 +1472,42 @@ class MultiROIFusionEngineV2(MultiROIFusionEngine):
         nf_r,nf_g,nf_b=self.skin_calibrator.get_normalization_factors()
         for roi_name,cfg_roi in ROI_CONFIGS.items():
             roi=self.rois[roi_name]
-            if suppress_cheeks and roi_name!="forehead": roi.valid=False; continue
+
+
+            if suppress_cheeks and roi_name != "forehead":
+                roi.dynamic_weight = max(roi.dynamic_weight * 0.25, 0.05)
+
             out=get_roi_polygon_masked(frame,face_landmarks,cfg_roi["landmarks"],h,w)
             if out is None: roi.valid=False; continue
             pts_arr,mr_raw,mg_raw,mb_raw,bbox,roi_bright=out; pm=np.zeros((h,w),dtype=np.uint8); cv2.fillPoly(pm,[pts_arr],255); sm=self.skin_map.get_skin_mask(frame,pm); sc=self.skin_map.get_skin_coverage(pm,sm); roi.skin_coverage=sc
-            if sc<0.20: roi.valid=False; continue
+
+            _sc_min_v2 = 0.10 if roi_name.startswith("cheek") else 0.18
+            if sc < _sc_min_v2: roi.valid=False; continue
             roi.pts=pts_arr; roi.bbox=bbox; roi.valid=True; roi.roi_brightness=roi_bright; self.micro_motion.update(frame,roi_name,bbox)
             if not is_moving and roi_bright<=220 and roi_bright>=40:
                 x1c=max(0,bbox[0]); y1c=max(0,bbox[1]); x2c=min(frame.shape[1],bbox[2]); y2c=min(frame.shape[0],bbox[3]); rc=frame[y1c:y2c,x1c:x2c]
                 if rc.size>0 and rc.shape[0]>=4 and rc.shape[1]>=4:
+
+                    if roi_name in self._flow_stab:
+                        rc_stable = self._flow_stab[roi_name].stabilize(frame, bbox)
+                        if rc_stable is not None and rc_stable.size > 0:
+                            rc = rc_stable
+
+                    if roi_name in self._pulse_sel:
+                        self._pulse_sel[roi_name].ingest(rc)
                     mr,mg,mb,vf,_=self.pixel_filter.filter_roi(rc,roi_name)
-                    if vf<0.1 or mr==0.0: mr,mg,mb=mr_raw,mg_raw,mb_raw
+                    if (vf<0.1 or mr==0.0) and roi_name in self._pulse_sel and self._pulse_sel[roi_name].has_weights():
+                        mr,mg,mb = self._pulse_sel[roi_name].weighted_mean_rgb(rc)
+                    elif vf<0.1 or mr==0.0: mr,mg,mb=mr_raw,mg_raw,mb_raw
                 else: mr,mg,mb=mr_raw,mg_raw,mb_raw
                 roi.buf_r.append(mr*nf_r); roi.buf_g.append(mg*nf_g); roi.buf_b.append(mb*nf_b); self.resampler.push(roi_name,now,mr*nf_r,mg*nf_g,mb*nf_b); self.skin_calibrator.update(mr,mg,mb)
             elif not is_moving: self.skin_calibrator.update(mr_raw,mg_raw,mb_raw)
         result.skin_tone_factor=nf_g
         valid_rois={}
         for k,v in self.rois.items():
-            if len(v.buf_g)<self.MIN_FRAMES or v.skin_coverage<0.18: continue
+            _sc_floor = 0.10 if k.startswith("cheek") else 0.18
+            if len(v.buf_g)<self.MIN_FRAMES or v.skin_coverage<_sc_floor: continue
             if v.roi_brightness<cfg.ROI_BRIGHTNESS_MIN or v.roi_brightness>cfg.ROI_BRIGHTNESS_MAX: continue
-            # v12: SNR gate removed; regularity gate disabled (REGULARITY_HARD_GATE=0)
             if v.bpm>0 and not (cfg.BPM_PLAUSIBLE_LOW<=v.bpm<=cfg.BPM_PLAUSIBLE_HIGH): continue
             valid_rois[k]=v
         valid_rois_res={}
@@ -1223,27 +1562,24 @@ class MultiROIFusionEngineV2(MultiROIFusionEngine):
         accepted_rois_only = {k: v[0] for k, v in accepted.items()}; cross_roi_harmonic_check(accepted_rois_only); roi_items=[]
         for roi_name,(roi,*_) in accepted.items():
             mp=self.micro_motion.get_weight_penalty(roi_name); w=compute_dynamic_roi_weight(roi,ROI_CONFIGS[roi_name]["base_weight"],motion_score,result.exposure_drift)*mp; roi.dynamic_weight=w; roi_items.append((roi_name,roi,w))
-        # Learned Weighting Adjustment
+
         learned_weights = self.learned_weighting.get_weights()
         roi_items_learned = []
         for name, roi, w in roi_items:
             lw = learned_weights.get(name, 1.0)
             roi_items_learned.append((name, roi, w * lw))
         
-        # Explicit Probabilistic Fusion
         roi_data = [(r.bpm, r.sqi) for _, r, _ in roi_items_learned]
         fused_bpm_prob = self.prob_fusion.fuse(roi_data)
         
-        # Fallback/Hybrid with hierarchical
         fused_bpm_hier = hierarchical_fusion(roi_items_learned)
         fused_bpm_raw = 0.7 * fused_bpm_prob + 0.3 * fused_bpm_hier
-        
-        # Update Learned Weights
+    
         roi_sqis = {n: r.sqi for n, r, _ in roi_items_learned}
         roi_bpms = {n: r.bpm for n, r, _ in roi_items_learned}
         self.learned_weighting.update_weights(roi_sqis, fused_bpm_raw, roi_bpms)
         if fused_bpm_raw>0:
-            smoothed=self.bpm_smoother.update(fused_bpm_raw); result.fused_bpm=smoothed; self._frozen_bpm=smoothed; sws=sum(compute_dynamic_roi_weight(v[0],ROI_CONFIGS[k]["base_weight"],motion_score,result.exposure_drift)*v[0].sqi for k,v in accepted.items() if v[0].sqi>=SQI_HARD_GATE); swd=sum(compute_dynamic_roi_weight(v[0],ROI_CONFIGS[k]["base_weight"],motion_score,result.exposure_drift) for k,v in accepted.items() if v[0].sqi>=SQI_HARD_GATE); result.fused_sqi=sws/swd if swd>0 else 0.0
+            smoothed=self.bpm_smoother.update(fused_bpm_raw); stabilized=self.bpm_median_stab.update(smoothed); result.fused_bpm=stabilized; self._frozen_bpm=stabilized; sws=sum(compute_dynamic_roi_weight(v[0],ROI_CONFIGS[k]["base_weight"],motion_score,result.exposure_drift)*v[0].sqi for k,v in accepted.items() if v[0].sqi>=SQI_HARD_GATE); swd=sum(compute_dynamic_roi_weight(v[0],ROI_CONFIGS[k]["base_weight"],motion_score,result.exposure_drift) for k,v in accepted.items() if v[0].sqi>=SQI_HARD_GATE); result.fused_sqi=sws/swd if swd>0 else 0.0
             n_valid_rois_v2 = len(accepted)
             if n_valid_rois_v2 < 2: result.fused_sqi *= cfg.SINGLE_ROI_SQI_MULT
             agr_pen = cfg.AGREEMENT_SQI_PENALTY_COEFF * max(0.0, cfg.AGREEMENT_SQI_PENALTY_BELOW - result.roi_agreement); result.fused_sqi *= max(0.0, 1.0 - agr_pen); result.n_valid_rois = n_valid_rois_v2
@@ -1251,7 +1587,7 @@ class MultiROIFusionEngineV2(MultiROIFusionEngine):
         self.session_scorer.update(result.fused_sqi,result.fused_bpm,is_moving,roi_agreement=result.roi_agreement); result.session_confidence=self.session_scorer.get_confidence(); result.roi_signals={k:v for k,v in self.rois.items()}; return result
 
     def get_diagnostics(self):
-        return {"method_wins":self.arbitrator.get_win_stats(),"confidence_trend":self.conf_trend.get_trend(),"skin_type":self.skin_calibrator.skin_type_label(),"session_confidence":self.session_scorer.get_confidence(),"calibration_done":self.calibration.done,"baseline_sqi":round(self.calibration.baseline_sqi,1),"last_pose":{"yaw":round(self._last_pose[0],1),"pitch":round(self._last_pose[1],1),"ok":self._last_pose[2]},"jaw_state":self._last_jaw_result,"per_roi_sqi":{k:round(v.sqi,1) for k,v in self.rois.items()},"per_roi_weight":{k:round(v.dynamic_weight,3) for k,v in self.rois.items()}}
+        return {"method_wins":self.arbitrator.get_win_stats(),"confidence_trend":self.conf_trend.get_trend(),"skin_type":self.skin_calibrator.skin_type_label(),"session_confidence":self.session_scorer.get_confidence(),"calibration_done":self.calibration.done,"baseline_sqi":round(self.calibration.baseline_sqi,1),"last_pose":{"yaw":round(self._last_pose[0],1),"pitch":round(self._last_pose[1],1),"ok":self._last_pose[2]},"jaw_state":self._last_jaw_result,"per_roi_sqi":{k:round(v.sqi,1) for k,v in self.rois.items()},"per_roi_weight":{k:round(v.dynamic_weight,3) for k,v in self.rois.items()},"physio_state":getattr(self,"_last_physio_state","RESTING"),"resp_rate_bpm":getattr(self,"_last_resp_bpm",0.0)}
 
     def reset(self):
         super().reset(); self.micro_motion.clear(); self.pixel_filter.clear(); self.resampler.clear(); self.conf_trend._sqi_history.clear(); self.resp_suppressor._resp_history.clear(); self.pose_gate._yaw_history.clear(); self.pose_gate._pitch_history.clear(); self.jaw_suppressor._jaw_history.clear(); self.jaw_suppressor._blink_history.clear(); self.jaw_suppressor._jaw_baseline=None; self.jaw_suppressor._talking_frames=0; self.jaw_suppressor._init_frames=0; self._last_jaw_result={}; self._last_pose=(0.0,0.0,True)

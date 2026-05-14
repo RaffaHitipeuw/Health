@@ -1,22 +1,5 @@
-"""
-rppg_benchmark.py  —  Research-Grade Benchmark & Ablation Framework
-=====================================================================
 
-PHASE 3 & 4 REVISION: Real ablation study + reproducible benchmark protocol.
 
-Key additions:
-    1. BlandAltmanAnalysis: bias + limits of agreement (clinical standard)
-    2. BootstrappedMetrics: confidence intervals on MAE, RMSE, Pearson r
-    3. AblationConfig: toggle individual components
-    4. AblationStudy: run real experiments (not placeholder stubs)
-    5. SensitivityAnalysis: partial derivatives of MAE w.r.t. parameters
-    6. ExperimentalProtocol: reproducible dataset conditions
-
-WHY ABLATION MATTERS:
-    Without it, you don't know which components actually help.
-    "The system works" != "each component contributes".
-    Ablation answers: what is the marginal contribution of each part?
-"""
 
 import time
 import json
@@ -26,14 +9,12 @@ from typing import List, Dict, Optional, Callable, Tuple
 from collections import defaultdict
 
 
-# ─── Metric Types ─────────────────────────────────────────────────────────────
-
 @dataclass
 class MetricResult:
-    """Point estimate + 95% bootstrapped confidence interval."""
+
     value: float
-    ci_lower: float      # 2.5th percentile of bootstrap
-    ci_upper: float      # 97.5th percentile of bootstrap
+    ci_lower: float
+    ci_upper: float
     n_samples: int
 
     def __str__(self):
@@ -42,27 +23,20 @@ class MetricResult:
 
 @dataclass
 class BlandAltmanResult:
-    """
-    Bland-Altman analysis for agreement between two measurement methods.
-    Reference: Bland & Altman, Lancet 1986.
 
-    Interpretation:
-        bias: systematic offset between methods
-        loa_upper/lower: 95% of differences lie within these limits
-        If LoA is clinically acceptable (e.g., ±5 BPM), methods agree.
-    """
-    bias: float                  # mean(rPPG - reference)
-    bias_ci: Tuple[float, float] # 95% CI on bias
-    loa_upper: float             # bias + 1.96 * std(differences)
-    loa_lower: float             # bias - 1.96 * std(differences)
+
+    bias: float
+    bias_ci: Tuple[float, float]
+    loa_upper: float
+    loa_lower: float
     loa_upper_ci: Tuple[float, float]
     loa_lower_ci: Tuple[float, float]
-    std_diff: float              # std of (rPPG - reference)
-    proportional_bias: float     # correlation of differences with means (ideally ~0)
+    std_diff: float
+    proportional_bias: float
     n: int
 
     def is_clinically_acceptable(self, tolerance_bpm: float = 5.0) -> bool:
-        """LoA within ±tolerance_bpm is clinically acceptable per IEC 60601."""
+
         return abs(self.loa_upper) <= tolerance_bpm and abs(self.loa_lower) <= tolerance_bpm
 
     def summary(self) -> str:
@@ -75,7 +49,7 @@ class BlandAltmanResult:
 
 @dataclass
 class BenchmarkResult:
-    """Full benchmark metrics for one experimental condition."""
+
     config_name: str
     mae:          MetricResult
     rmse:         MetricResult
@@ -88,8 +62,6 @@ class BenchmarkResult:
     condition:    str   = "unknown"
 
 
-# ─── Statistical Analysis Functions ───────────────────────────────────────────
-
 def bootstrap_metric(
     fn: Callable[[np.ndarray, np.ndarray], float],
     measured: np.ndarray,
@@ -97,20 +69,13 @@ def bootstrap_metric(
     n_bootstrap: int = 1000,
     confidence: float = 0.95,
 ) -> MetricResult:
-    """
-    Compute metric with bootstrapped confidence interval.
 
-    Parametric CI (assuming normality) is unreliable for MAE, RMSE
-    because the error distribution is often non-Gaussian.
-    Bootstrap CI is distribution-free and valid for any metric.
 
-    n_bootstrap=1000: standard for 95% CI with <1% MC error.
-    """
     n = len(measured)
     point_estimate = fn(measured, reference)
 
     boot_values = np.empty(n_bootstrap)
-    rng = np.random.default_rng(42)  # reproducible seed
+    rng = np.random.default_rng(42)
     for i in range(n_bootstrap):
         idx = rng.integers(0, n, size=n)
         boot_values[i] = fn(measured[idx], reference[idx])
@@ -132,12 +97,8 @@ def bland_altman_analysis(
     reference: np.ndarray,
     n_bootstrap: int = 1000,
 ) -> BlandAltmanResult:
-    """
-    Full Bland-Altman analysis with bootstrapped CI on all statistics.
 
-    differences = measured - reference
-    means = (measured + reference) / 2
-    """
+
     differences = measured - reference
     means       = (measured + reference) / 2.0
     n           = len(differences)
@@ -147,15 +108,14 @@ def bland_altman_analysis(
     loa_up   = bias + 1.96 * std_diff
     loa_lo   = bias - 1.96 * std_diff
 
-    # Proportional bias: Pearson r between differences and means
-    # If r != 0, the method disagrees more at high/low HR
+
     try:
         from scipy.stats import pearsonr as sp_pearsonr
         prop_r, _ = sp_pearsonr(differences, means)
     except Exception:
         prop_r = 0.0
 
-    # Bootstrap CI on bias and LoA
+
     rng = np.random.default_rng(seed=42)
 
     def _boot(fn, n_boot=n_bootstrap):
@@ -195,9 +155,8 @@ def compute_metrics(
     latency_ms: float = 0.0,
     sqi_values: Optional[np.ndarray] = None,
 ) -> BenchmarkResult:
-    """
-    Compute all benchmark metrics with statistical rigor.
-    """
+
+
     measured  = np.asarray(measured,  dtype=float)
     reference = np.asarray(reference, dtype=float)
     assert len(measured) == len(reference), "Arrays must have same length"
@@ -232,40 +191,34 @@ def compute_metrics(
     )
 
 
-# ─── Ablation Configuration ───────────────────────────────────────────────────
-
 @dataclass
 class AblationConfig:
-    """
-    Component toggles for ablation study.
 
-    Each flag removes exactly one component. The marginal contribution
-    of component X = metric(Full) - metric(Full - X).
-    """
+
     name: str = "full_system"
 
-    # Signal processing
-    use_pos_projection:     bool = True    # POS vs GREEN channel
-    use_windowing:          bool = True    # Hann window vs rectangular
-    use_bandpass_filter:    bool = True    # bandpass vs raw signal
-    use_detrending:         bool = True    # detrending vs raw signal
 
-    # Quality gating
-    use_sqi_gate:           bool = True    # filter by SQI
-    use_motion_rejection:   bool = True    # reject during motion
-    use_illumination_gate:  bool = True    # reject during exposure drift
+    use_pos_projection:     bool = True
+    use_windowing:          bool = True
+    use_bandpass_filter:    bool = True
+    use_detrending:         bool = True
 
-    # Fusion
-    use_multi_roi_fusion:   bool = True    # multi-ROI vs forehead-only
-    use_probabilistic_fusion: bool = True  # Bayesian vs simple average
-    use_hierarchical_cluster: bool = True  # clustering vs direct average
 
-    # Temporal
-    use_kalman_filter:      bool = True    # Kalman vs raw BPM
-    use_temporal_smoothing: bool = True    # EMA smoothing vs none
+    use_sqi_gate:           bool = True
+    use_motion_rejection:   bool = True
+    use_illumination_gate:  bool = True
 
-    # Uncertainty
-    use_uncertainty_weighting: bool = True  # uncertainty-weighted vs equal weight
+
+    use_multi_roi_fusion:   bool = True
+    use_probabilistic_fusion: bool = True
+    use_hierarchical_cluster: bool = True
+
+
+    use_kalman_filter:      bool = True
+    use_temporal_smoothing: bool = True
+
+
+    use_uncertainty_weighting: bool = True
 
     @classmethod
     def full(cls) -> "AblationConfig":
@@ -314,21 +267,17 @@ class AblationConfig:
         ]
 
 
-# ─── Experimental Conditions ──────────────────────────────────────────────────
-
 @dataclass
 class ExperimentalCondition:
-    """
-    Protocol specification for one test condition.
-    Inspired by MAHNOB-HCI, VIPL-HR, and OBF benchmark protocols.
-    """
+
+
     name: str
     description: str
-    lighting: str          # "bright", "dim", "mixed", "fluorescent"
-    head_motion: str       # "still", "nodding", "talking", "rotation"
-    skin_tone: str         # "type_I_II", "type_III_IV", "type_V_VI"
+    lighting: str
+    head_motion: str
+    skin_tone: str
     fps_range: Tuple[float, float]
-    target_snr_db: float   # Expected SNR range
+    target_snr_db: float
 
     @classmethod
     def standard_conditions(cls) -> List["ExperimentalCondition"]:
@@ -350,21 +299,8 @@ class ExperimentalCondition:
         ]
 
 
-# ─── Ablation Study Framework ─────────────────────────────────────────────────
-
 class AblationStudy:
-    """
-    Framework for running ablation studies.
 
-    Usage:
-        study = AblationStudy(engine_factory)
-        for config in AblationConfig.all_ablations():
-            for condition in ExperimentalCondition.standard_conditions():
-                result = study.run(config, condition, ground_truth_data)
-        study.print_table()
-
-    The engine_factory should accept AblationConfig and return a configured engine.
-    """
 
     def __init__(self, engine_factory: Optional[Callable] = None):
         self.engine_factory = engine_factory
@@ -380,13 +316,8 @@ class AblationStudy:
         sqi_values: Optional[np.ndarray] = None,
         latency_ms: float = 0.0,
     ) -> BenchmarkResult:
-        """
-        Run ablation with pre-computed BPM arrays and ground truth.
 
-        This is the primary interface when you have recorded sessions.
-        measured_bpms: array of rPPG-estimated BPM per time step
-        reference_bpms: array of ground-truth BPM (ECG/PPG reference)
-        """
+
         result = compute_metrics(
             measured_bpms, reference_bpms,
             config_name=config.name,
@@ -404,13 +335,12 @@ class AblationStudy:
         return result
 
     def print_table(self):
-        """Print ablation table in research paper format."""
+
         if not self.results:
             print("No results yet. Run experiments first.")
             return
 
         header = f"{'Component':<25} | {'MAE':<20} | {'RMSE':<20} | {'Pearson r':<20} | {'Bias':<10} | {'LoA':<20}"
-        print("\n" + "=" * len(header))
         print("ABLATION STUDY RESULTS")
         print("=" * len(header))
         print(header)
@@ -430,11 +360,8 @@ class AblationStudy:
         print("      LoA = Bland-Altman limits of agreement")
 
     def marginal_contributions(self) -> Dict[str, dict]:
-        """
-        Compute marginal contribution of each component.
-        delta_MAE = MAE(without_component) - MAE(full_system)
-        Positive = component helps; negative = component hurts.
-        """
+
+
         full_result = next((r for r in self.results if r.config_name == "full_system"), None)
         if full_result is None:
             return {}
@@ -448,30 +375,20 @@ class AblationStudy:
             delta_rmse   = r.rmse.value - full_result.rmse.value
             delta_pearson = full_result.pearson_r.value - r.pearson_r.value
             contributions[component] = {
-                "delta_mae":    round(delta_mae, 3),    # positive = component helps
+                "delta_mae":    round(delta_mae, 3),
                 "delta_rmse":   round(delta_rmse, 3),
                 "delta_pearson": round(delta_pearson, 3),
-                "is_critical":  delta_mae > 1.0,  # >1 BPM MAE impact = critical
+                "is_critical":  delta_mae > 1.0,
             }
         return contributions
 
 
-# ─── Sensitivity Analysis ─────────────────────────────────────────────────────
-
 class SensitivityAnalysis:
-    """
-    Numerical sensitivity of MAE to each parameter.
-    Answers: which parameters actually matter?
 
-    Sensitivity index S_i = |d MAE / d theta_i| * |theta_i / MAE|
-    S_i > 0.5: parameter is critical (must be calibrated)
-    S_i < 0.05: parameter is insensitive (can be fixed)
-    """
 
     def __init__(self, evaluate_fn: Callable[[dict], float]):
-        """
-        evaluate_fn: takes parameter dict -> returns MAE float.
-        """
+
+
         self.evaluate_fn = evaluate_fn
         self.results: Dict[str, dict] = {}
 
@@ -480,10 +397,8 @@ class SensitivityAnalysis:
         nominal_params: dict,
         perturbation_fraction: float = 0.10,
     ) -> Dict[str, dict]:
-        """
-        Central-difference sensitivity for each parameter.
-        Uses 10% perturbation (common in engineering sensitivity analysis).
-        """
+
+
         mae_nominal = self.evaluate_fn(nominal_params)
         if mae_nominal == 0:
             mae_nominal = 1e-6
@@ -500,10 +415,10 @@ class SensitivityAnalysis:
             mae_plus  = self.evaluate_fn(params_plus)
             mae_minus = self.evaluate_fn(params_minus)
 
-            # Central-difference derivative
+
             d_mae_d_theta = (mae_plus - mae_minus) / (2 * delta)
 
-            # Normalized sensitivity index
+
             sensitivity = abs(d_mae_d_theta) * abs(nominal_value) / mae_nominal
 
             self.results[param_name] = {
@@ -530,19 +445,8 @@ class SensitivityAnalysis:
             print(f"{name:<35} | {info['nominal']:>10.3g} | {info['d_mae']:>12.4f} | {info['sensitivity']:>8.3f} | {crit:>10}")
 
 
-# ─── Reproducibility Protocol ─────────────────────────────────────────────────
-
 class ReproducibilityProtocol:
-    """
-    Ensures experiments are reproducible.
 
-    Research-grade reproducibility requires:
-    1. Fixed random seed
-    2. Logged software version + dependencies
-    3. Parameter snapshot at experiment start
-    4. Raw data preserved (before processing)
-    5. Exact metric computation documented
-    """
 
     def __init__(self, version: str = "2.0.0"):
         self.version = version
@@ -568,7 +472,7 @@ class ReproducibilityProtocol:
             json.dump(entry, f, indent=2)
 
     def assert_reproducible(self, fn: Callable, n_runs: int = 3) -> bool:
-        """Verify that fn() returns the same result on n_runs consecutive calls."""
+
         results = [fn() for _ in range(n_runs)]
         if all(isinstance(r, (int, float)) for r in results):
             are_equal = np.allclose(results, results[0], atol=1e-6)
@@ -578,13 +482,8 @@ class ReproducibilityProtocol:
         return True
 
 
-# ─── Stress Test Suite ────────────────────────────────────────────────────────
-
 class StressTestBenchmark:
-    """
-    Stress-test suite. Each scenario tests robustness to one failure mode.
-    Real implementation requires pre-recorded test videos.
-    """
+
 
     SCENARIOS = {
         "low_light":           "< 50 lux ambient illumination",

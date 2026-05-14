@@ -157,12 +157,12 @@ class WellnessGuidanceEngine:
                 tips.append(("LIGHT", "Too dark — face more light sources"))
             elif mean_brightness > 220:
                 tips.append(("LIGHT", "Overexposed — reduce backlight or move away from window"))
-            if motion_score > 2.8:  # FIX2: synced with cfg.MOTION_ENTER_THRESHOLD (was 4 – gaslighting users)
+            if motion_score > 2.8:
                 tips.append(("MOTION", "Too much movement — stay still for better reading"))
             else:
                 tips.append(("DIST", "Poor signal — try moving 40-70cm from camera"))
         elif sqi < 40:
-            if motion_score > 1.8:  # FIX2: synced with cfg.MOTION_EXIT_THRESHOLD (was 2.5)
+            if motion_score > 1.8:
                 tips.append(("MOTION", "Minor motion detected — stay still"))
             if mean_brightness < 80:
                 tips.append(("LIGHT", "Improve lighting for better accuracy"))
@@ -178,7 +178,7 @@ class WellnessGuidanceEngine:
         msg = None
         if not face_detected:
             msg = "Position your face in the center of the frame"
-        elif motion_score > 2.8:  # FIX2: synced with cfg.MOTION_ENTER_THRESHOLD (was 5.0)
+        elif motion_score > 2.8:
             msg = "Please stay still for an accurate reading"
         elif mean_brightness < 55:
             msg = "Move to better lighting or turn on more lights"

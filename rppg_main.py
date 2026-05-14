@@ -9,7 +9,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from rppg_config import cfg
-from rppg_config import cfg as _cfg  # for SQI_DISPLAY_GATE
+from rppg_config import cfg as _cfg
 from rppg_core import (MultiROIFusionEngine, MultiROIFusionEngineV2,
                         ROI_CONFIGS, BUFFER_SIZE,
                         SQI_HARD_GATE, MOTION_ENTER_THRESHOLD, MOTION_EXIT_THRESHOLD)
@@ -35,7 +35,7 @@ PALETTE = {
     "teal":        (180, 220, 100),
 }
 
-MIN_FRAMES = _cfg.MIN_FRAMES  # Bug4 fix: sync with engine (was hardcoded 90)
+MIN_FRAMES = _cfg.MIN_FRAMES
 
 
 def draw_panel(img, x1, y1, x2, y2, alpha=0.75):
@@ -136,10 +136,7 @@ def draw_spectrum_graph(canvas, freqs, power, peak_bpm, h, w):
 def draw_vitals_panel(canvas, vitals: VitalsResult, baseline_dev: dict, h: int, w: int):
     draw_panel(canvas, 0, 0, w, h)
 
-    # Bug fix: BPM was missing from this panel entirely.
-    # The panel is the only persistent display of vitals — users looking here
-    # for their heart rate found every metric except the primary one.
-    # BPM confidence colour mirrors the 4-tier scheme used in the main overlay.
+
     sqi_val = getattr(vitals, "sqi", 0.0)
     bpm_color = (PALETTE["green"]  if sqi_val >= 55 else
                  PALETTE["yellow"] if sqi_val >= 35 else
@@ -148,7 +145,7 @@ def draw_vitals_panel(canvas, vitals: VitalsResult, baseline_dev: dict, h: int, 
     bpm_label = PALETTE["red_bright"] if vitals.stress_index > 60 else PALETTE["yellow"]
 
     rows = [
-        # BPM is the primary metric — show it first, full-width style (col 0)
+
         ("BPM",      f"{vitals.bpm:.0f}" if vitals.bpm > 0 else "--",
                                              "bpm",    bpm_color),
         ("RESP",     f"{vitals.resp_rate:.1f}",   "br/min",  PALETTE["cyan"]),
@@ -164,7 +161,7 @@ def draw_vitals_panel(canvas, vitals: VitalsResult, baseline_dev: dict, h: int, 
         col  = i % 3
         row  = i // 3
         cx   = col * col_w + 8
-        cy   = row * (h // 3) + 28   # 3 rows now (was 2) — spread over panel height
+        cy   = row * (h // 3) + 28
         put_text(canvas, label, cx, cy - 14, 0.38, PALETTE["gray"])
         put_text(canvas, val,   cx, cy,      0.72, color, 2)
         if unit:
@@ -305,25 +302,6 @@ def draw_history_panel(canvas, history_rows: list, trend: dict, h: int, w: int):
 
 
 def main():
-    print("\n" + "="*68)
-    print("  rPPG Research System v5.0 — Upgraded (All MUST criteria applied)")
-    print("="*68)
-    print(f"  SQI Hard Gate:    {SQI_HARD_GATE}  (was 22)")
-    print(f"  Motion Hysteresis: enter>{MOTION_ENTER_THRESHOLD}  exit<{MOTION_EXIT_THRESHOLD}")
-    print("  ROI Weighting:    Dynamic (brightness × stability × SNR × regularity)")
-    print("  BPM Smoothing:    Kalman + EMA + Median rolling")
-    print("  Arrhythmia:       Sustained multi-window + cooldown (45s)")
-    print("  Baseline Gate:    SQI ≥ 50 (was 35)")
-    print("  FFT Validation:   Harmonic rejection + peak width + dominance")
-    print("  Session Score:    Running session confidence %")
-    print("  Exposure Comp:    Auto drift detection + normalization")
-    print("-"*68)
-    print("  [Q]  Quit             [R]  Reset buffers")
-    print("  [S]  Save session     [A]  AI analysis")
-    print("  [H]  Toggle history   [M]  Paper metrics (Bland-Altman + Pearson)")
-    print("  [G]  Ground truth BPM [P]  Pulse oximeter input")
-    print("  [T]  Start robustness test  [F]  Failure mode log")
-    print("="*68 + "\n")
 
     cap = None
     for idx in [1, 2]:
@@ -341,9 +319,9 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-    # Mengaktifkan Auto Exposure agar tidak gelap
-    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3) # 3 biasanya berarti Auto Mode di banyak driver
-    # cap.set(cv2.CAP_PROP_EXPOSURE, -2) # Baris ini yang bikin gelap, kita matikan manualnya
+
+    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3)
+
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"  Camera: {W}x{H}")
@@ -408,7 +386,7 @@ def main():
         vitals_engine.update_fps(fps_avg)
         frame = cv2.GaussianBlur(frame, (3, 3), 0)
 
-        # Run MediaPipe every frame during warmup, skip after
+
         _mp_interval = 1 if frame_count < 90 else _mediapipe_every
         if frame_count % _mp_interval == 0:
             rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -428,46 +406,34 @@ def main():
 
         mean_brightness = fr.frame_brightness
 
-        # v12: show always – color communicates confidence, not show/hide
+
         if fr.motion_rejected:
             _motion_clear_frame = -1
             holdover_age = now - last_valid_bpm_ts
             display_bpm = last_valid_bpm if (last_valid_bpm > 0 and holdover_age <= BPM_HOLDOVER_SEC) else display_bpm
         elif _motion_clear_frame < 0:
-            # Motion just cleared – start grace period
+
             _motion_clear_frame = frame_count
             display_bpm = last_valid_bpm if last_valid_bpm > 0 else display_bpm
         elif frame_count - _motion_clear_frame < _cfg.MOTION_GRACE_FRAMES:
             display_bpm = last_valid_bpm if last_valid_bpm > 0 else display_bpm
         elif fr.fused_bpm > 0:
-            # v12: any valid BPM → show it. SQI drives color, not visibility.
+
             display_bpm       = fr.fused_bpm
             last_valid_bpm    = fr.fused_bpm
             last_valid_bpm_ts = now
         elif last_valid_bpm > 0 and (now - last_valid_bpm_ts) <= BPM_HOLDOVER_SEC:
-            display_bpm = last_valid_bpm   # holdover while signal momentarily lost
+            display_bpm = last_valid_bpm
 
         if not fr.motion_rejected:
             vitals_engine.ingest_signal(fr.chrom_signal, fr.fused_bpm, fr.fused_sqi)
 
-        # Bug fix (two issues combined):
-        #
-        # 1. `MIN_FRAMES` here was the *main loop* constant (synced to cfg=60),
-        #    but VitalsEngine.MIN_FRAMES was hardcoded to 120 — so even after
-        #    this gate passed, compute() still returned early.  Both are now
-        #    cfg.MIN_FRAMES (60), so the gate and the engine agree.
-        #    Use vitals_engine.MIN_FRAMES explicitly so they stay in sync.
-        #
-        # 2. `SQI_HARD_GATE * 0.7` = 14% at gate=20 — this is almost always
-        #    true and adds no protection.  The real guard belongs inside
-        #    compute() which already handles low-SQI gracefully (returns
-        #    partial VitalsResult with confidence_label="LOW").
-        #    Remove the SQI gate here; let compute() decide what to compute.
+
         _vitals_ready = (
             frame_count % 15 == 0
-            and len(fr.chrom_signal) >= vitals_engine.MIN_FRAMES  # synced to cfg
+            and len(fr.chrom_signal) >= vitals_engine.MIN_FRAMES
             and not fr.motion_rejected
-            # SQI gate removed — compute() handles low quality internally
+
         )
         if _vitals_ready:
             vitals_result = vitals_engine.compute(fr.chrom_signal, fr.fused_bpm, fr.fused_sqi)
@@ -551,22 +517,28 @@ def main():
         cv2.addWeighted(overlay, 0.8, frame, 0.2, 0, frame)
 
         if display_bpm > 0:
-            # v12: 4-tier confidence color (SQI drives color, not show/hide)
+
             sqi = fr.fused_sqi
-            if sqi >= 55:
-                bpm_c = PALETTE["green"]       # high confidence
-            elif sqi >= 35:
-                bpm_c = PALETTE["yellow"]      # medium confidence
-            elif sqi >= 18:
-                bpm_c = PALETTE["orange"]      # low confidence
+            
+
+            if fr.fused_bpm == 0 and fr.n_valid_rois > 0:
+                put_text(frame, "BPM: Analyzing...", 20, 44, 1.2, PALETTE["yellow"], 2)
+                put_text(frame, f"Signal low quality ({sqi:.0f}%) — stabilize...", 20, 62, 0.45, PALETTE["orange"])
             else:
-                bpm_c = PALETTE["red_bright"]  # very low – take with grain of salt
-            lock_icon = " 🔒" if fr.bpm_locked else ""
-            put_text(frame, f"BPM: {display_bpm:.0f}{lock_icon}", 20, 44, 1.2, bpm_c, 2)
-            cl   = vitals_result.confidence_label
-            cl_c = PALETTE["green"] if cl == "GOOD" else PALETTE["yellow"] if cl == "FAIR" else PALETTE["red"]
-            put_text(frame, f"conf: {fr.fused_sqi:.0f}%  [{cl}]  Session:{fr.session_confidence:.0f}%",
-                     20, 62, 0.45, cl_c)
+                if sqi >= 55:
+                    bpm_c = PALETTE["green"]
+                elif sqi >= 35:
+                    bpm_c = PALETTE["yellow"]
+                elif sqi >= 18:
+                    bpm_c = PALETTE["orange"]
+                else:
+                    bpm_c = PALETTE["red_bright"]
+                lock_icon = " 🔒" if fr.bpm_locked else ""
+                put_text(frame, f"BPM: {display_bpm:.0f}{lock_icon}", 20, 44, 1.2, bpm_c, 2)
+                cl   = vitals_result.confidence_label
+                cl_c = PALETTE["green"] if cl == "GOOD" else PALETTE["yellow"] if cl == "FAIR" else PALETTE["red"]
+                put_text(frame, f"conf: {fr.fused_sqi:.0f}%  [{cl}]  Session:{fr.session_confidence:.0f}%",
+                         20, 62, 0.45, cl_c)
 
             bd   = fr.sqi_breakdown
             if bd:
@@ -592,19 +564,14 @@ def main():
                          W // 2 - 130, 22, 0.45, bdev_c)
 
         elif fr.fused_bpm > 0 and fr.fused_sqi < SQI_HARD_GATE:
-            # Bug fix: this branch was only reachable when display_bpm==0 but
-            # fused_bpm>0 -- e.g. during startup grace period while SQI is
-            # already low.  In that edge-case we STILL want to show the BPM
-            # (v12 intent: "color communicates confidence, not show/hide") and
-            # append a dimmed sub-label so the user understands quality is low.
-            # We also push to display_bpm here so the next frame's holdover
-            # logic has a valid base to carry forward.
+
+
             _show_bpm   = fr.fused_bpm
-            display_bpm = fr.fused_bpm          # ensure holdover has a value
+            display_bpm = fr.fused_bpm
             last_valid_bpm    = fr.fused_bpm
             last_valid_bpm_ts = now
             put_text(frame, f"BPM: {_show_bpm:.0f}", 20, 44, 1.2,
-                     PALETTE["orange"], 2)       # orange = low-confidence colour
+                     PALETTE["orange"], 2)
             put_text(frame, f"low signal  SQI:{fr.fused_sqi:.0f}%",
                      20, 58, 0.38, PALETTE["orange"])
             if sqi_explanations:
@@ -656,11 +623,21 @@ def main():
 
         method_stats = fusion_engine.arbitrator.get_win_stats()
         winner_label = max(method_stats, key=method_stats.get).upper()
+
+
+        _t3 = fr.top3_peaks if fr.top3_peaks else []
+        _t3_str = "  |  Peaks: " + "  ".join(
+            f"#{i+1} {bpm:.0f}BPM(pw={pw:.3f})" for i, (bpm, pw) in enumerate(_t3[:3])
+        ) if _t3 else ""
+        _subharm_str = "  ⚠ SUBHARM→corrected" if fr.subharm_corrected else ""
+
         draw_signal_graph(
             graph_canvas, fr.chrom_signal, GRAPH_H, W,
             color=PALETTE["green"],
             label=f"Method:{winner_label} (CHROM:{method_stats['chrom']:.0%} POS:{method_stats['pos']:.0%} G:{method_stats['green']:.0%})"
-                  f"  |  Motion:{fr.motion_score:.1f}  |  SQI-trend:{trend_data.get('trend','?')}",
+                  f"  |  Motion:{fr.motion_score:.1f}  |  SQI-trend:{trend_data.get('trend','?')}"
+                  f"  |  State:{getattr(fr,'physio_state','?')} RR:{getattr(fr,'resp_rate_bpm',0):.0f}br/min CF:{getattr(fr,'cardiac_fraction',1.0):.2f}"
+                  f"{_t3_str}{_subharm_str}",
             bpm=fr.fused_bpm, sqi=fr.fused_sqi, sqi_breakdown=fr.sqi_breakdown,
             session_confidence=fr.session_confidence
         )

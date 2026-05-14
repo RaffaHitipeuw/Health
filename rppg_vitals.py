@@ -6,10 +6,9 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 import time
-# Bug fix: was hardcoded 50.0 — out of sync with cfg.BASELINE_SQI_THRESHOLD (45.0).
-# Using cfg ensures the gate matches the rest of the system. When both values
-# differ, calibration rejects frames that every other module already accepted.
-BASELINE_SQI_GATE = cfg.BASELINE_SQI_THRESHOLD  # 45.0
+
+
+BASELINE_SQI_GATE = cfg.BASELINE_SQI_THRESHOLD
 
 @dataclass
 class VitalsResult:
@@ -119,10 +118,9 @@ class VitalsEngine:
 
     def __init__(self, fps: float=30.0):
         self.fps = fps
-        # Bug fix: was hardcoded 120 -- mismatch with cfg.MIN_FRAMES (60).
-        # At 60/60 frames the engine returned early so BPM/HRV never appeared
-        # until the buffer hit 120. Single source of truth: cfg.MIN_FRAMES.
-        self.MIN_FRAMES = cfg.MIN_FRAMES  # 60
+
+
+        self.MIN_FRAMES = cfg.MIN_FRAMES
         self.ibi_history = deque(maxlen=200)
         self.bpm_history = deque(maxlen=30)
         self.resp_history = deque(maxlen=30)
@@ -152,9 +150,9 @@ class VitalsEngine:
 
     def compute(self, chrom_signal: np.ndarray, fused_bpm: float, sqi: float) -> VitalsResult:
         result = VitalsResult(bpm=fused_bpm, sqi=sqi)
-        if sqi >= 65:
+        if sqi >= 70:
             result.confidence_label = 'GOOD'
-        elif sqi >= 40:
+        elif sqi >= 45:
             result.confidence_label = 'FAIR'
         else:
             result.confidence_label = 'LOW'
@@ -247,7 +245,7 @@ class VitalsEngine:
             return 0.0
 
     def _arrhythmia_check_sustained(self, ibi: np.ndarray, bpm: float, sqi: float) -> tuple:
-        if sqi < cfg.ARRHYTHMIA_SQI_GATE:  # Fix #8: only active when signal stable
+        if sqi < cfg.ARRHYTHMIA_SQI_GATE:
             return (False, '')
         if len(ibi) < 10:
             return (False, '')
