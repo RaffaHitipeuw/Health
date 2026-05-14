@@ -86,7 +86,9 @@ class ROISignal:
     agreement_factor: float = 1.0
     _reg_history: object = field(default_factory=lambda: deque(maxlen=8))
     _var_history: object = field(default_factory=lambda: deque(maxlen=8))
-    _bpm_history: object = field(default_factory=lambda: deque(maxlen=15))
+    _bpm_history: object = field(default_factory=lambda: deque(maxlen=150))
+    _peak_persistence_count: int = 0
+    _last_stable_peak: float = 0.0
     is_harmonic_suspect: bool = False
 
     _bad_streak: int = 0
@@ -101,6 +103,7 @@ class ROISignal:
         self.agreement_factor = 1.0; self.is_harmonic_suspect = False
         self._reg_history.clear(); self._var_history.clear()
         self._bpm_history.clear(); self._bad_streak = 0; self._excluded_until = 0
+        self._peak_persistence_count = 0; self._last_stable_peak = 0.0
 
 
 @dataclass
@@ -482,14 +485,23 @@ def bandpass_filter(data, fps, lowcut=0.833, highcut=3.0, order=4):
     return sosfilt(sos, data)
 
 def detrend(data):
-
-
+    # Step 1: Linear detrending
     data = scipy_detrend(data, type='linear')
-
-    window = int(30 * 2)
+    
+    # Step 2: Robust moving average subtraction for non-linear drift
+    # Using a window size that scales with typical heart rate (≈ 1-2 seconds)
+    window = int(30 * 1.5) # 1.5 seconds at 30 FPS
     if len(data) > window:
-        ma = np.convolve(data, np.ones(window)/window, mode='same')
-        data = data - ma
+        # Pad to avoid edge artifacts
+        padded = np.pad(data, (window // 2, window // 2), mode='reflect')
+        ma = np.convolve(padded, np.ones(window)/window, mode='valid')
+        data = data - ma[:len(data)]
+    
+    # Step 3: Standardize to unit variance for FFT stability
+    std = np.std(data)
+    if std > 1e-9:
+        data = data / std
+        
     return data
 
 def chrom_rppg(r, g, b):
@@ -504,19 +516,20 @@ def pos_rppg(r, g, b):
     C = np.vstack([rn, gn, bn]); Pn = np.dot([0, 1, -1], C); S2 = np.dot([0, 1, 1], C)
     return Pn / (np.std(Pn) + 1e-9) - (np.std(Pn) / (np.std(S2) + 1e-9)) * (S2 / (np.std(S2) + 1e-9))
 
+def is_physiologically_plausible(bpm):
+    """Hard gate for human heart rate plausibility."""
+    return cfg.BPM_LOW <= bpm <= cfg.BPM_HIGH
+
 def _pick_one_peak(fft_v, freqs, mask, prev_bpm=None):
-
-
     if not np.any(mask): return None
     
-
     idxs, _ = find_peaks(fft_v, distance=3)
     idxs = [i for i in idxs if mask[i]]
     
     if not idxs:
-        return freqs[mask][np.argmax(fft_v[mask])]
+        raw_hz = freqs[mask][np.argmax(fft_v[mask])]
+        return raw_hz if is_physiologically_plausible(raw_hz * 60.0) else 0.0
     
-
     top_idxs = sorted(idxs, key=lambda i: fft_v[i], reverse=True)[:5]
     candidates = []
     
@@ -525,49 +538,77 @@ def _pick_one_peak(fft_v, freqs, mask, prev_bpm=None):
         bpm = hz * 60.0
         power = fft_v[idx]
         
-
-        score = power
+        # Physiological Plausibility Weighting
+        # Instead of a hard reject here, we penalize heavily so we can still find a lower peak
+        plausibility_weight = 1.0
+        if not (cfg.BPM_PLAUSIBLE_LOW <= bpm <= cfg.BPM_PLAUSIBLE_HIGH):
+            plausibility_weight = 0.1  # Heavy penalty for being in the "extreme" or "artifact" zones
+            
+        score = power * plausibility_weight
         
         if prev_bpm is not None and prev_bpm > 0:
-
-
+            # Harmonic rejection: if this peak is ~2x previous stable BPM
             if abs(bpm - prev_bpm * 2) < cfg.HARMONIC_PROXIMITY_TOL:
-                score *= 0.4
+                score *= 0.2 # Increased penalty
                 
-
             dist = abs(bpm - prev_bpm)
             proximity = np.exp(-(dist**2) / (2 * 15.0**2))
-            score *= (0.5 + 0.5 * proximity)
+            score *= (0.4 + 0.6 * proximity)
             
-
-            if dist > 30:
-                score *= 0.3
+            if dist > 25:
+                score *= 0.2 # Faster drop-off
         
         candidates.append({'hz': hz, 'bpm': bpm, 'score': score, 'power': power, 'idx': idx})
     
-
     candidates = sorted(candidates, key=lambda x: x['score'], reverse=True)
     
-
-
+    # Advanced Harmonic Check & Peak Ambiguity
     best = candidates[0]
-    if best['bpm'] > cfg.HARMONIC_BPM_THRESHOLD:
-        half_bpm = best['bpm'] / 2.0
-
-        for other in candidates[1:]:
-            if abs(other['bpm'] - half_bpm) < 5.0:
-
-                if len(candidates) > 1:
-
-                    for cand in candidates[1:]:
-                        if cand['bpm'] < cfg.HARMONIC_BPM_THRESHOLD or abs(cand['bpm'] - half_bpm) < 5.0:
-                            return cand['hz']
     
+    # Peak Ambiguity Check: if second peak is too close in power, signal is noisy
+    if len(candidates) > 1:
+        p1, p2 = best['power'], candidates[1]['power']
+        if p2 > p1 * 0.85: # Ambiguity threshold
+            # If ambiguous, prefer the one closer to prev_bpm or the more plausible one
+            if prev_bpm is not None and prev_bpm > 0:
+                d1 = abs(best['bpm'] - prev_bpm)
+                d2 = abs(candidates[1]['bpm'] - prev_bpm)
+                if d2 < d1 - 5: # Candidate 2 is significantly closer to history
+                    best = candidates[1]
+    
+    # Explicit Harmonic Trap: 144/72, 120/60, etc.
+    # If we are high and previously were low, or vice versa, check for doubling/halving
+    if prev_bpm is not None and prev_bpm > 0:
+        # Doubling trap (e.g., stuck at 144 while history is 72)
+        if best['bpm'] > 110 and abs(best['bpm'] - prev_bpm * 2) < 10:
+            # Look for a candidate near the original prev_bpm
+            for cand in candidates[1:]:
+                if abs(cand['bpm'] - prev_bpm) < 10:
+                    best = cand
+                    break
+        # Halving trap (e.g., stuck at 60 while history is 120)
+        elif best['bpm'] < 75 and abs(best['bpm'] - prev_bpm / 2.0) < 8:
+             for cand in candidates[1:]:
+                if abs(cand['bpm'] - prev_bpm) < 12:
+                    best = cand
+                    break
 
-    for other in candidates[1:]:
-        if abs(best['bpm'] - 2 * other['bpm']) < 7.0:
-            if other['power'] > best['power'] * 0.3:
-                return other['hz']
+    # If the best candidate is still suspicious (e.g. 144 BPM), look for sub-harmonics
+    if best['bpm'] > 130.0:
+        half_bpm = best['bpm'] / 2.0
+        for other in candidates[1:]:
+            # If there's a peak at roughly half the frequency with decent power, prefer it
+            if abs(other['bpm'] - half_bpm) < 6.0 and other['power'] > best['power'] * 0.15:
+                best = other
+                break
+
+    # Final plausibility check for the winner
+    if not is_physiologically_plausible(best['bpm']):
+        # If best is still bad, try to find ANY plausible candidate
+        for cand in candidates[1:]:
+            if is_physiologically_plausible(cand['bpm']):
+                return cand['hz']
+        return 0.0 # No plausible peak found
                 
     return best['hz']
 
@@ -824,8 +865,14 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
     motion_penalty=0.0
 
 
-    if motion_score > 2.0: 
-        motion_penalty = min((motion_score - 2.0) / 8.0, cfg.SQI_MAX_MOTION_PENALTY)
+    # Motion Penalty: Harusnya kalau motion=REJECT, minimal freeze BPM, reduce confidence heavily
+    if motion_score > cfg.MOTION_EXIT_THRESHOLD: 
+        # Increase penalty slope and lower the threshold to match motion detector
+        motion_penalty = min((motion_score - cfg.MOTION_EXIT_THRESHOLD) / 4.0, cfg.SQI_MAX_MOTION_PENALTY)
+        
+        # If motion is high enough to be REJECTED by detector, force a heavy penalty
+        if motion_score > cfg.MOTION_ENTER_THRESHOLD:
+            motion_penalty = max(motion_penalty, 0.7)
 
         if hasattr(roi_obj, 'motion_penalty'):
             motion_penalty *= (2.0 - roi_obj.motion_penalty)
@@ -1085,6 +1132,11 @@ class MultiROIFusionEngine:
             if v.roi_brightness<cfg.ROI_BRIGHTNESS_MIN or v.roi_brightness>cfg.ROI_BRIGHTNESS_MAX: continue
 
             if v.bpm>0 and not (cfg.BPM_PLAUSIBLE_LOW<=v.bpm<=cfg.BPM_PLAUSIBLE_HIGH): continue
+            
+            # Regularity Gate: if signal is completely irregular (reg=0), it's noise
+            if hasattr(v, 'roi_regularity') and v.roi_regularity < cfg.REGULARITY_HARD_GATE:
+                continue
+                
             valid_rois[k]=v
         if not valid_rois: result.roi_signals={k:v for k,v in self.rois.items()}; return result
         for roi_name,roi in valid_rois.items():
@@ -1096,11 +1148,15 @@ class MultiROIFusionEngine:
                     extractor = get_algorithm_by_name(algo_name)
                     sc = extractor(arr_r, arr_g, arr_b)
                     
-                    sc = detrend(sc)
+                    # Unified signal cleaning chain
+                    sc = detrend(sc) # Includes moving average and standardization
                     sc = self.exposure_comp.normalize_roi_signal(sc)
                     sig_filt = bandpass_filter(sc, fps)
-                    _std=float(np.std(sig_filt))
-                    if _std>1e-8: sig_filt=(sig_filt-np.mean(sig_filt))/_std
+                    
+                    # Final zero-mean, unit-variance for SQI calculation
+                    _std = np.std(sig_filt)
+                    if _std > 1e-9:
+                        sig_filt = (sig_filt - np.mean(sig_filt)) / _std
 
 
                     reg_history = list(roi._reg_history)
@@ -1137,7 +1193,19 @@ class MultiROIFusionEngine:
                     
                     sqi = 0.5 * sqi_cal + 0.5 * sqi_legacy
                     roi.bpm=bpm_raw; roi.sqi=sqi; roi.roi_snr=sqi_meta.get("snr_db", 0.0); roi.roi_regularity=sqi_meta.get("spectral_entropy", 0.0)
-                    if bpm_raw>0: roi._bpm_history.append(bpm_raw)
+                    if bpm_raw>0: 
+                        roi._bpm_history.append(bpm_raw)
+                        # Peak Persistence Tracking
+                        if abs(bpm_raw - roi._last_stable_peak) < cfg.PEAK_PERSISTENCE_BPM_TOL:
+                            roi._peak_persistence_count += 1
+                        else:
+                            roi._last_stable_peak = bpm_raw
+                            roi._peak_persistence_count = 0
+                        
+                        # If peak is absurdly stable (likely artifact/frequency locking)
+                        if roi._peak_persistence_count > cfg.PEAK_PERSISTENCE_LIMIT:
+                            sqi *= 0.3 # Penalize the locked peak
+                            roi.agreement_factor *= 0.5
                     if sqi < cfg.ROI_BAD_SQI_THRESH:
                         roi._bad_streak += 1
                         if roi._bad_streak >= cfg.ROI_BAD_STREAK_LIMIT: roi._excluded_until = self.frame_count + cfg.ROI_REHAB_FRAMES; roi._bad_streak = 0
@@ -1169,18 +1237,38 @@ class MultiROIFusionEngine:
         if not candidates: candidates = {ref_roi.name: ref_roi}
 
 
-        candidate_bpms = [r.bpm for r in candidates.values()]
-        median_bpm = float(np.median(candidate_bpms))
+        all_valid_bpms = [r.bpm for r in valid_rois.values() if r.bpm > 0]
+        median_bpm = float(np.median(all_valid_bpms)) if all_valid_bpms else 0.0
         
+        # Spread-based consensus: if ROIs are on "different planets", penalize everything
+        spread = max(all_valid_bpms) - min(all_valid_bpms) if len(all_valid_bpms) >= 2 else 0.0
+        global_consensus_penalty = 1.0
+        if spread > 15.0:
+            global_consensus_penalty = max(0.2, 1.0 - (spread - 15.0) / 30.0)
+
         for roi in candidates.values():
-            dev = abs(roi.bpm - ref_bpm)
-            roi.agreement_factor = float(np.exp(-dev / cfg.AGREEMENT_DEV_K))
+            # Distance from median of ALL ROIs, not just candidates
+            dev = abs(roi.bpm - median_bpm)
+            raw_agreement = float(np.exp(-dev / cfg.AGREEMENT_DEV_K))
             
+            # SQI & Regularity weights: if reg is low, this ROI is noise
+            sqi_factor = np.clip(roi.sqi / 100.0, 0.05, 1.0)
+            reg_factor = np.clip(roi.roi_regularity / 100.0, 0.0, 1.0)
+            
+            # KILL SWITCH: If regularity is 0, this ROI is a zombie
+            if roi.roi_regularity < 5.0: # Using 5% as absolute floor
+                reg_factor = 0.01
+                roi.dynamic_weight *= 0.05
 
-            if abs(roi.bpm - median_bpm) > cfg.ROI_CONSENSUS_THRESHOLD:
-
+            physio_factor = 1.0
+            if not (cfg.BPM_PLAUSIBLE_LOW <= roi.bpm <= cfg.BPM_PLAUSIBLE_HIGH):
+                physio_factor = 0.1 # More aggressive penalty for 144 BPM
+            
+            roi.agreement_factor = raw_agreement * sqi_factor * reg_factor * physio_factor * global_consensus_penalty
+            
+            if dev > cfg.ROI_CONSENSUS_THRESHOLD:
                 roi.dynamic_weight *= cfg.ROI_BRUTAL_PENALTY
-                roi.agreement_factor *= 0.1
+                roi.agreement_factor *= 0.05
         
         accepted = {k: v for k, v in candidates.items() if v.agreement_factor >= cfg.ROI_MIN_AGREEMENT_FACTOR}
         if not accepted:
@@ -1202,7 +1290,11 @@ class MultiROIFusionEngine:
         if len(accepted) > 2: accepted = dict(sorted(accepted.items(), key=lambda x: x[1].sqi, reverse=True)[:2])
         cross_roi_harmonic_check(accepted); roi_items=[]
         for roi_name,roi in accepted.items():
-            w=compute_dynamic_roi_weight(roi,ROI_CONFIGS[roi_name]["base_weight"],motion_score,result.exposure_drift); roi.dynamic_weight=w; roi_items.append((roi_name,roi,w))
+            w=compute_dynamic_roi_weight(roi,ROI_CONFIGS[roi_name]["base_weight"],motion_score,result.exposure_drift)
+            # Forehead Dominance Clamp: prevent 1.0 dominance
+            if roi_name == "forehead":
+                w = min(w, 0.55)
+            roi.dynamic_weight=w; roi_items.append((roi_name,roi,w))
 
 
         learned_weights = self.learned_weighting.get_weights()

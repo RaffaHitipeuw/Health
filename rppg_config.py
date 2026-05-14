@@ -32,7 +32,7 @@ class RPPGConfig:
 
     FUSION_OUTLIER_THRESHOLD: float = 8.0
 
-    REGULARITY_HARD_GATE: float = 0.0
+    REGULARITY_HARD_GATE: float = 10.0 # 0.0 survived before, now needs at least 10% regularity
 
     FFT_DOMINANCE_STRONG: float = 0.30
     FFT_DOMINANCE_MEDIUM: float = 0.15
@@ -136,6 +136,9 @@ class RPPGConfig:
     PEAK_PROMINENCE_MIN: float = 0.40
     CONSENSUS_STD_MAX: float = 8.0
     PEAK_DOMINANCE_RATIO_MIN: float = 2.0
+    
+    PEAK_PERSISTENCE_LIMIT: int = 150 # Frames before we suspect peak locking
+    PEAK_PERSISTENCE_BPM_TOL: float = 1.0
 
     KALMAN_Q_BPM: float = 0.5
     KALMAN_Q_VEL: float = 0.005
