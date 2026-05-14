@@ -113,11 +113,12 @@ class RPPGConfig:
     ROI_BRIGHTNESS_MIN: float = 45.0
     ROI_BRIGHTNESS_MAX: float = 205.0
 
-    SQI_WEIGHT_SNR:          float = 0.38
-    SQI_WEIGHT_REGULARITY:   float = 0.25
-    SQI_WEIGHT_TEMPORAL:     float = 0.17
-    SQI_WEIGHT_PEAK_CONSIST: float = 0.15
-    SQI_WEIGHT_VARIANCE:     float = 0.05
+    SQI_WEIGHT_SNR:          float = 0.30
+    SQI_WEIGHT_REGULARITY:   float = 0.30
+    SQI_WEIGHT_TEMPORAL:     float = 0.20
+    SQI_WEIGHT_PEAK_CONSIST: float = 0.10
+    SQI_WEIGHT_MOTION:       float = 0.10
+    SQI_WEIGHT_VARIANCE:     float = 0.00
     SQI_PENALTY_WEIGHT:      float = 0.40
     SQI_MAX_MOTION_PENALTY:  float = 0.60
     SQI_MAX_LIGHTING_PENALTY: float = 0.30
@@ -126,6 +127,11 @@ class RPPGConfig:
     BPM_MAX_DELTA_PER_SEC: float = 10.0
     ROI_CONSENSUS_THRESHOLD: float = 15.0
     ROI_BRUTAL_PENALTY: float = 0.15
+    TEMPORAL_ANCHOR_TAU: float = 10.0
+    TEMPORAL_MAX_DELTA: float = 15.0
+    HARMONIC_PENALTY_MULT: float = 0.15
+    SESSION_CONF_ALPHA: float = 0.10
+    SESSION_CONF_HARD_REJECT_DECAY: float = 0.85
     EMA_ALPHA_CINEMATIC: float = 0.25
     HARMONIC_SNR_RATIO: float = 0.30
     ROI_AUTO_DISABLE_SEC: int = 3

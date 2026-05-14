@@ -21,24 +21,37 @@ def apply_windowing(signal, window_type='hann'):
 
 
 def mature_harmonic_rejection(psd, freqs, peak_hz, threshold=0.15):
+    """
+    Checks if peak_hz is likely a harmonic of a lower fundamental frequency.
+    If 144 BPM is strong but 72 BPM also exists, prefer 72 BPM.
+    """
+    # 1. Check if peak_hz itself is a harmonic of a lower frequency
+    sub_harmonics = [peak_hz / 2.0, peak_hz / 3.0]
+    main_mask = (freqs >= peak_hz - 0.1) & (freqs <= peak_hz + 0.1)
+    main_peak = np.max(psd[main_mask]) if np.any(main_mask) else 1e-9
+    
+    for sub_h in sub_harmonics:
+        if sub_h < 0.7: # Below 42 BPM
+            continue
+        sub_mask = (freqs >= sub_h - 0.1) & (freqs <= sub_h + 0.1)
+        if np.any(sub_mask):
+            sub_peak = np.max(psd[sub_mask])
+            # If sub-harmonic has significant energy (even if lower than main peak),
+            # it's highly suspicious that the main peak is just a harmonic.
+            if sub_peak > 0.3 * main_peak:
+                return True
 
-
+    # 2. Check if higher harmonics are unusually strong (classic rPPG failure)
     harmonics = [2 * peak_hz, 3 * peak_hz]
     for h in harmonics:
         if h > freqs[-1]:
             continue
         h_mask = (freqs >= h - 0.1) & (freqs <= h + 0.1)
-        if not np.any(h_mask):
-            continue
-        h_peak   = np.max(psd[h_mask])
-        main_mask = (freqs >= peak_hz - 0.1) & (freqs <= peak_hz + 0.1)
-        main_peak = np.max(psd[main_mask]) if np.any(main_mask) else 1e-9
-        if h_peak > threshold * main_peak:
-            sub_h = peak_hz / 2.0
-            if sub_h >= 0.7:
-                sub_mask = (freqs >= sub_h - 0.1) & (freqs <= sub_h + 0.1)
-                if np.any(sub_mask) and np.max(psd[sub_mask]) > 0.3 * main_peak:
-                    return True
+        if np.any(h_mask):
+            h_peak = np.max(psd[h_mask])
+            if h_peak > threshold * main_peak:
+                return True
+                
     return False
 
 

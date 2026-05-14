@@ -91,7 +91,7 @@ class PosteriorSQI:
         sig_z = (signal - np.mean(signal)) / (np.std(signal) + 1e-9)
         min_dist = max(int(fps * 0.45), 5)
         peaks, _ = find_peaks(sig_z, distance=min_dist, prominence=0.35)
-        reg = self._regularity(peaks, fps)
+        reg = self._regularity(peaks, fps, signal=sig_z)
         self._regularity_history.append(reg)
         reg = float(np.mean(self._regularity_history))
         reg_logit = (reg - 0.5) / 0.3
@@ -160,14 +160,43 @@ class PosteriorSQI:
             n_samples=n,
         )
 
-    def _regularity(self, peaks: np.ndarray, fps: float) -> float:
-        if len(peaks) < 2:
-            return 0.0
-        if len(peaks) < 3:
-            return 0.2
-        ibi = np.diff(peaks) / fps
-        cv  = float(np.std(ibi) / (np.mean(ibi) + 1e-9))
-        return float(np.clip(1.0 - cv, 0.0, 1.0))
+    def _regularity(self, peaks: np.ndarray, fps: float, signal: np.ndarray = None) -> float:
+        """
+        Calculates signal regularity using both peak-to-peak interval consistency (CV)
+        and autocorrelation-based periodicity.
+        """
+        # 1. Peak-to-Peak Consistency (Time Domain)
+        reg_peaks = 0.0
+        if len(peaks) >= 3:
+            ibi = np.diff(peaks) / fps
+            cv  = float(np.std(ibi) / (np.mean(ibi) + 1e-9))
+            reg_peaks = float(np.clip(1.0 - cv, 0.0, 1.0))
+        elif len(peaks) == 2:
+            reg_peaks = 0.2
+
+        # 2. Autocorrelation Periodicity (Waveform Consistency)
+        reg_acf = 0.0
+        if signal is not None and len(signal) >= 30:
+            from scipy.signal import correlate, find_peaks
+            n = len(signal)
+            # Normalize signal for ACF
+            sig_norm = (signal - np.mean(signal)) / (np.std(signal) + 1e-9)
+            acf = correlate(sig_norm, sig_norm, mode='full')[n-1:]
+            acf = acf / (acf[0] + 1e-12) # Normalize by zero-lag
+            
+            # Find the second peak (first peak after zero-lag)
+            # Humans have HR between 42-200 BPM -> 0.3s to 1.4s lag
+            min_lag = int(fps * 0.3)
+            max_lag = int(fps * 1.5)
+            if len(acf) > min_lag:
+                acf_search = acf[min_lag:min_lag + max_lag]
+                if len(acf_search) > 0:
+                    reg_acf = float(np.max(acf_search))
+        
+        # Combined Regularity: Humans aren't metronomes, so we take a weighted max
+        # If either the peaks are consistent OR the waveform is periodic, it's valid.
+        combined_reg = 0.6 * reg_acf + 0.4 * reg_peaks
+        return float(np.clip(combined_reg, 0.0, 1.0))
 
     def reset(self):
         self._sqi_history.clear()

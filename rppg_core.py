@@ -280,7 +280,7 @@ class SessionConfidenceScorer:
 
         self.session_conf_ema = 0.0
 
-    def update(self, sqi, bpm, is_moving, roi_agreement=1.0, n_valid_rois=1):
+    def update(self, sqi, bpm, is_moving, roi_agreement=1.0, n_valid_rois=1, hard_reject=False):
         if is_moving:
             self.motion_samples.append(1.0)
         else:
@@ -297,13 +297,11 @@ class SessionConfidenceScorer:
         mean_agr = float(np.mean(self.agreement_samples)) if self.agreement_samples else 1.0
         motion_ratio = float(np.mean(self.motion_samples))
 
-
         if len(self.bpm_samples) >= 5:
             bpm_std = float(np.std(self.bpm_samples))
             consistency = float(np.exp(-bpm_std / 10.0))
         else:
             consistency = 0.5
-
 
         roi_bonus = 1.0 if n_valid_rois >= 2 else 0.85
 
@@ -317,12 +315,14 @@ class SessionConfidenceScorer:
         agr_mult = max(cfg.SESSION_CONF_AGREEMENT_FLOOR, mean_agr)
         instant_conf = float(np.clip(raw_conf * agr_mult * roi_bonus * 100.0, 0, 100))
         
-
-        alpha = 0.02
+        alpha = cfg.SESSION_CONF_ALPHA
         if self.session_conf_ema == 0:
             self.session_conf_ema = instant_conf
         else:
             self.session_conf_ema = alpha * instant_conf + (1 - alpha) * self.session_conf_ema
+        
+        if hard_reject:
+            self.session_conf_ema *= cfg.SESSION_CONF_HARD_REJECT_DECAY
             
         self.confidence = self.session_conf_ema
 
@@ -891,7 +891,7 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
         cfg.SQI_WEIGHT_REGULARITY * reg_score +
         cfg.SQI_WEIGHT_TEMPORAL * temp_stability +
         cfg.SQI_WEIGHT_PEAK_CONSIST * peak_consistency +
-        cfg.SQI_WEIGHT_VARIANCE * var_score
+        cfg.SQI_WEIGHT_MOTION * (1.0 - motion_penalty)
     )
     total_penalty = (motion_penalty + lighting_penalty + fft_penalty) / 3.0
     raw = weighted_score - (cfg.SQI_PENALTY_WEIGHT * total_penalty)
@@ -955,6 +955,10 @@ def compute_dynamic_roi_weight(roi, base_weight, motion_score, exposure_drift=0.
     history_score = temp_stab
     dyn_weight_factor = (snr_score * 0.5 + agr_score * 0.3 + history_score * 0.2)
     
+    # Hard suppression for outliers
+    if not (cfg.BPM_PLAUSIBLE_LOW <= roi.bpm <= cfg.BPM_PLAUSIBLE_HIGH):
+        dyn_weight_factor *= cfg.ROI_BRUTAL_PENALTY
+        
     weight = base_weight * dyn_weight_factor
 
     
@@ -1192,7 +1196,13 @@ class MultiROIFusionEngine:
                             sqi_cal *= 0.7
                     
                     sqi = 0.5 * sqi_cal + 0.5 * sqi_legacy
-                    roi.bpm=bpm_raw; roi.sqi=sqi; roi.roi_snr=sqi_meta.get("snr_db", 0.0); roi.roi_regularity=sqi_meta.get("spectral_entropy", 0.0)
+                    
+                    # Hard Gate Regularity: SQI *= 0.4 if reg < 15
+                    reg_score = sqi_meta.get("regularity_score", 0.0) * 100.0
+                    if reg_score < 15.0:
+                        sqi *= 0.4
+                        
+                    roi.bpm=bpm_raw; roi.sqi=sqi; roi.roi_snr=sqi_meta.get("snr_db", 0.0); roi.roi_regularity=reg_score
                     if bpm_raw>0: 
                         roi._bpm_history.append(bpm_raw)
                         # Peak Persistence Tracking
@@ -1348,7 +1358,20 @@ class MultiROIFusionEngine:
             result.fused_bpm = self._frozen_bpm
             result.bpm_locked = True
         elif fused_bpm_raw > 0:
-            smoothed=self.bpm_smoother.update(fused_bpm_raw); stabilized=self.bpm_median_stab.update(smoothed); result.fused_bpm=stabilized; self._frozen_bpm=stabilized
+            # Temporal Physiological Anchor
+            prev_fused = self._frozen_bpm if self._frozen_bpm > 0 else fused_bpm_raw
+            delta_bpm = abs(fused_bpm_raw - prev_fused)
+            temporal_penalty = 1.0
+            if delta_bpm > cfg.TEMPORAL_MAX_DELTA:
+                temporal_penalty = float(np.exp(-delta_bpm / cfg.TEMPORAL_ANCHOR_TAU))
+            
+            # Temporal Fusion Memory (Inertia)
+            # Humans don't teleport. 0.8 * prev + 0.2 * current
+            fused_bpm_raw_inertia = 0.8 * prev_fused + 0.2 * fused_bpm_raw
+            
+            fused_bpm_raw_anchored = fused_bpm_raw_inertia * temporal_penalty + prev_fused * (1.0 - temporal_penalty)
+            
+            smoothed=self.bpm_smoother.update(fused_bpm_raw_anchored); stabilized=self.bpm_median_stab.update(smoothed); result.fused_bpm=stabilized; self._frozen_bpm=stabilized
 
             _best_roi = max(accepted.values(), key=lambda r: r.sqi)
             result.top3_peaks = getattr(_best_roi, '_top3_peaks', [])
@@ -1356,13 +1379,19 @@ class MultiROIFusionEngine:
             sqi_w_sum=sum(compute_dynamic_roi_weight(r,ROI_CONFIGS[n]["base_weight"],motion_score,result.exposure_drift)*r.sqi for n,r in accepted.items() if r.sqi>0)
             sqi_w_den=sum(compute_dynamic_roi_weight(r,ROI_CONFIGS[n]["base_weight"],motion_score,result.exposure_drift) for n,r in accepted.items() if r.sqi>0)
             result.fused_sqi=sqi_w_sum/sqi_w_den if sqi_w_den>0 else 0.0
+            
+            # Apply temporal penalty to SQI too
+            result.fused_sqi *= temporal_penalty
+            
             n_valid_rois = len(accepted)
             if n_valid_rois < 2: result.fused_sqi *= cfg.SINGLE_ROI_SQI_MULT
             agr_pen = cfg.AGREEMENT_SQI_PENALTY_COEFF * max(0.0, cfg.AGREEMENT_SQI_PENALTY_BELOW - result.roi_agreement)
             result.fused_sqi *= max(0.0, 1.0 - agr_pen); result.n_valid_rois = n_valid_rois
             sigs=[(np.array(r.buf_g),r.sqi) for r in accepted.values() if r.sqi>0]
             if sigs: result.chrom_signal=max(sigs,key=lambda x:x[1])[0]
-        self.session_scorer.update(result.fused_sqi,result.fused_bpm,is_moving,roi_agreement=result.roi_agreement,n_valid_rois=getattr(result,'n_valid_rois',1))
+        
+        is_hard_reject = (result.roi_agreement < 0.4) or (not (cfg.BPM_PLAUSIBLE_LOW <= result.fused_bpm <= cfg.BPM_PLAUSIBLE_HIGH))
+        self.session_scorer.update(result.fused_sqi,result.fused_bpm,is_moving,roi_agreement=result.roi_agreement,n_valid_rois=getattr(result,'n_valid_rois',1), hard_reject=is_hard_reject)
         
 
         self.uncertainty_engine.update(result.fused_bpm, result.fused_sqi, result.roi_agreement)
