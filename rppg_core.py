@@ -865,17 +865,17 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
     motion_penalty=0.0
 
 
-    # Motion Penalty: Harusnya kalau motion=REJECT, minimal freeze BPM, reduce confidence heavily
-    if motion_score > cfg.MOTION_EXIT_THRESHOLD: 
-        # Increase penalty slope and lower the threshold to match motion detector
+    # Hard Propagation of Detector State
+    motion_penalty = 0.0
+    if motion_score > cfg.MOTION_EXIT_THRESHOLD:
         motion_penalty = min((motion_score - cfg.MOTION_EXIT_THRESHOLD) / 4.0, cfg.SQI_MAX_MOTION_PENALTY)
         
-        # If motion is high enough to be REJECTED by detector, force a heavy penalty
+        # Hard rejection: if detector says REJECT, force penalty to 1.0
         if motion_score > cfg.MOTION_ENTER_THRESHOLD:
-            motion_penalty = max(motion_penalty, 0.7)
+            motion_penalty = 1.0 # Brutal penalty for REJECT state
 
         if hasattr(roi_obj, 'motion_penalty'):
-            motion_penalty *= (2.0 - roi_obj.motion_penalty)
+            motion_penalty = min(1.0, motion_penalty + roi_obj.motion_penalty)
 
     bref=roi_brightness if roi_brightness>=0 else mean_brightness
     lighting_penalty=0.0
@@ -883,8 +883,12 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
     elif bref>210: lighting_penalty=min((bref-210)/40.0, cfg.SQI_MAX_LIGHTING_PENALTY)
     if exposure_drift > cfg.EXPOSURE_DRIFT_WARN:
         drift_ratio = min((exposure_drift - cfg.EXPOSURE_DRIFT_WARN) / (cfg.EXPOSURE_DRIFT_FREEZE - cfg.EXPOSURE_DRIFT_WARN), 1.0)
-        drift_sqi_pen = drift_ratio * cfg.EXPOSURE_DRIFT_SQI_PENALTY
-        lighting_penalty = min(lighting_penalty + drift_sqi_pen, cfg.SQI_MAX_LIGHTING_PENALTY)
+        # If drift is near freeze threshold, force heavy penalty
+        if exposure_drift > cfg.EXPOSURE_DRIFT_FREEZE * 0.8:
+            lighting_penalty = 0.9
+        else:
+            drift_sqi_pen = drift_ratio * cfg.EXPOSURE_DRIFT_SQI_PENALTY
+            lighting_penalty = min(lighting_penalty + drift_sqi_pen, cfg.SQI_MAX_LIGHTING_PENALTY)
 
     weighted_score = (
         cfg.SQI_WEIGHT_SNR * snr_score +
@@ -955,9 +959,17 @@ def compute_dynamic_roi_weight(roi, base_weight, motion_score, exposure_drift=0.
     history_score = temp_stab
     dyn_weight_factor = (snr_score * 0.5 + agr_score * 0.3 + history_score * 0.2)
     
-    # Hard suppression for outliers
+    # Hard suppression for outliers and bad signals
     if not (cfg.BPM_PLAUSIBLE_LOW <= roi.bpm <= cfg.BPM_PLAUSIBLE_HIGH):
         dyn_weight_factor *= cfg.ROI_BRUTAL_PENALTY
+    
+    # Pre-gating: Kill weight if SQI or regularity is too low
+    if roi.sqi < cfg.SQI_HARD_GATE or roi.roi_regularity < cfg.REGULARITY_HARD_GATE:
+        dyn_weight_factor = 0.0
+    
+    # Kill weight if motion is in REJECT state
+    if motion_score > cfg.MOTION_ENTER_THRESHOLD:
+        dyn_weight_factor = 0.0
         
     weight = base_weight * dyn_weight_factor
 
@@ -1037,9 +1049,14 @@ def _fuse_cluster(cluster):
 
 def hierarchical_fusion(roi_items, min_cluster_weight_frac=None):
     if not roi_items: return 0.0
-    clamped = [(n, r, float(np.clip(w, cfg.DYN_WEIGHT_MIN, cfg.DYN_WEIGHT_MAX))) for n, r, w in roi_items]
+    # Normalization Trap Fix: Filter out zero-weight ROIs first
+    valid_items = [(n, r, w) for n, r, w in roi_items if w > 0]
+    if not valid_items: return 0.0
+    
+    clamped = [(n, r, float(np.clip(w, cfg.DYN_WEIGHT_MIN, cfg.DYN_WEIGHT_MAX))) for n, r, w in valid_items]
     total_w = sum(c[2] for c in clamped)
     if total_w <= 0: return 0.0
+    
     normalized = []
     for n, r, w in clamped:
         frac = w / total_w
@@ -1358,20 +1375,25 @@ class MultiROIFusionEngine:
             result.fused_bpm = self._frozen_bpm
             result.bpm_locked = True
         elif fused_bpm_raw > 0:
-            # Temporal Physiological Anchor
-            prev_fused = self._frozen_bpm if self._frozen_bpm > 0 else fused_bpm_raw
-            delta_bpm = abs(fused_bpm_raw - prev_fused)
-            temporal_penalty = 1.0
-            if delta_bpm > cfg.TEMPORAL_MAX_DELTA:
-                temporal_penalty = float(np.exp(-delta_bpm / cfg.TEMPORAL_ANCHOR_TAU))
-            
-            # Temporal Fusion Memory (Inertia)
-            # Humans don't teleport. 0.8 * prev + 0.2 * current
-            fused_bpm_raw_inertia = 0.8 * prev_fused + 0.2 * fused_bpm_raw
-            
-            fused_bpm_raw_anchored = fused_bpm_raw_inertia * temporal_penalty + prev_fused * (1.0 - temporal_penalty)
-            
-            smoothed=self.bpm_smoother.update(fused_bpm_raw_anchored); stabilized=self.bpm_median_stab.update(smoothed); result.fused_bpm=stabilized; self._frozen_bpm=stabilized
+            # Hard State Propagation: If motion is REJECTED, do not update temporal memory
+            if motion_score > cfg.MOTION_ENTER_THRESHOLD:
+                result.fused_bpm = self._frozen_bpm
+                result.bpm_locked = True
+            else:
+                # Temporal Physiological Anchor
+                prev_fused = self._frozen_bpm if self._frozen_bpm > 0 else fused_bpm_raw
+                delta_bpm = abs(fused_bpm_raw - prev_fused)
+                temporal_penalty = 1.0
+                if delta_bpm > cfg.TEMPORAL_MAX_DELTA:
+                    temporal_penalty = float(np.exp(-delta_bpm / cfg.TEMPORAL_ANCHOR_TAU))
+                
+                # Temporal Fusion Memory (Inertia)
+                # Humans don't teleport. 0.8 * prev + 0.2 * current
+                fused_bpm_raw_inertia = 0.8 * prev_fused + 0.2 * fused_bpm_raw
+                
+                fused_bpm_raw_anchored = fused_bpm_raw_inertia * temporal_penalty + prev_fused * (1.0 - temporal_penalty)
+                
+                smoothed=self.bpm_smoother.update(fused_bpm_raw_anchored); stabilized=self.bpm_median_stab.update(smoothed); result.fused_bpm=stabilized; self._frozen_bpm=stabilized
 
             _best_roi = max(accepted.values(), key=lambda r: r.sqi)
             result.top3_peaks = getattr(_best_roi, '_top3_peaks', [])
