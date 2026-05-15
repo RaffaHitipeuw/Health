@@ -113,10 +113,10 @@ class RPPGConfig:
     ROI_BRIGHTNESS_MIN: float = 45.0
     ROI_BRIGHTNESS_MAX: float = 205.0
 
-    SQI_WEIGHT_SNR:          float = 0.15
-    SQI_WEIGHT_REGULARITY:   float = 0.25
-    SQI_WEIGHT_TEMPORAL:     float = 0.20
-    SQI_WEIGHT_PEAK_CONSIST: float = 0.30
+    SQI_WEIGHT_SNR:          float = 0.25
+    SQI_WEIGHT_REGULARITY:   float = 0.30
+    SQI_WEIGHT_TEMPORAL:     float = 0.30
+    SQI_WEIGHT_PEAK_CONSIST: float = 0.15
     SQI_WEIGHT_MOTION:       float = 0.10
     SQI_WEIGHT_VARIANCE:     float = 0.00
     SQI_PENALTY_WEIGHT:      float = 0.40

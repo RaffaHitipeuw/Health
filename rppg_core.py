@@ -597,11 +597,11 @@ def _pick_one_peak(fft_v, freqs, mask, prev_bpm=None):
                     break
 
     # If the best candidate is still suspicious (e.g. 144 BPM), look for sub-harmonics
-    if best['bpm'] > 130.0:
+    # Petunjuk: if abs(main_bpm / 2 - secondary_bpm) < 8: choose_lower_peak()
+    if best['bpm'] > 110.0:
         half_bpm = best['bpm'] / 2.0
         for other in candidates[1:]:
-            # If there's a peak at roughly half the frequency with decent power, prefer it
-            if abs(other['bpm'] - half_bpm) < 6.0 and other['power'] > best['power'] * 0.15:
+            if abs(other['bpm'] - half_bpm) < 8.0 and other['power'] > best['power'] * 0.12:
                 best = other
                 break
 
@@ -769,13 +769,15 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
     physio_prior = 1.0
     # ── Forehead High BPM Penalty (Petunjuk) ───────────────────────────────────
     # Forehead often locks to harmonic frequencies (144 BPM) or monitor flicker.
-    # We apply a brutal penalty if forehead reports high BPM while isolated.
-    if roi_name == "forehead" and peak_bpm > 130:
-        physio_prior = 0.3
+    # Petunjuk: if bpm > 130: sqi *= 0.2
+    if peak_bpm > 130:
+        physio_prior = 0.2
+    elif roi_name == "forehead" and peak_bpm > 115:
+        physio_prior = 0.4
     elif peak_bpm > cfg.PHYSIO_PRIOR_HIGH_BPM_THRESH and motion_score < cfg.PHYSIO_PRIOR_MOTION_EXEMPT:
-        physio_prior = cfg.PHYSIO_PRIOR_HIGH_BPM_SQI_MULT   # 0.18 — near-kill
+        physio_prior = cfg.PHYSIO_PRIOR_HIGH_BPM_SQI_MULT
     elif peak_bpm > cfg.PHYSIO_PRIOR_ELEV_BPM_THRESH and motion_score < cfg.PHYSIO_PRIOR_MOTION_EXEMPT:
-        physio_prior = cfg.PHYSIO_PRIOR_ELEV_BPM_SQI_MULT   # 0.55
+        physio_prior = cfg.PHYSIO_PRIOR_ELEV_BPM_SQI_MULT
 
     # Unstable BPM history still gets a penalty (kept from original logic)
     if roi_obj is not None and hasattr(roi_obj, '_bpm_history') and len(roi_obj._bpm_history) >= 5:
@@ -796,7 +798,15 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
         if abs(_corr) > cfg.SINE_PURITY_THRESHOLD:
             sine_purity_mult = cfg.SINE_PURITY_SQI_MULT
 
-    bio_penalty = physio_prior * sine_purity_mult
+    # ── Temporal Inertia Penalty (Petunjuk) ──────────────────────────────────
+    # Heart rate doesn't teleport. Penalty if jump > 25 BPM.
+    temporal_inertia_mult = 1.0
+    if roi_obj is not None and hasattr(roi_obj, '_bpm_history') and len(roi_obj._bpm_history) > 0:
+        last_bpm = list(roi_obj._bpm_history)[-1]
+        if abs(peak_bpm - last_bpm) > 25:
+            temporal_inertia_mult = 0.4
+
+    bio_penalty = physio_prior * sine_purity_mult * temporal_inertia_mult
 
     sig=signal-np.mean(signal); sig=scipy_detrend(sig,type="linear")
     n=len(sig); fft_v=np.abs(np.fft.rfft(sig*np.hanning(n)))**2
@@ -823,14 +833,19 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
 
     sig_norm=(sig-sig.mean())/(sig.std()+1e-9)
     peaks,_=find_peaks(sig_norm,distance=int(fps*0.50),prominence=cfg.PEAK_PROMINENCE_MIN,height=0.1)
+    # ── REG=0 Fix (Petunjuk) ──────────────────────────────────────────────────
+    # Regularity metric was too strict. Relaxing CV threshold.
     if len(peaks)>=3:
         intervals=np.diff(peaks); cv=np.std(intervals)/(np.mean(intervals)+1e-9)
-        reg_raw=max(0.0,1.0-cv*1.5)
+        # Relaxed from 1.5 to 1.2 multiplier to be less brutal on human heart rate variability
+        reg_raw=max(0.05, 1.0 - cv * 1.2) 
         if roi_obj is not None: roi_obj._reg_history.append(reg_raw)
     elif len(peaks)==2:
-        reg_raw=0.20
+        reg_raw=0.25 # Increased from 0.20
         if roi_obj is not None: roi_obj._reg_history.append(reg_raw)
-    else: reg_raw=None
+    else: 
+        reg_raw=0.10 # Instead of None/0, give a baseline for clean signals that just have few peaks
+        if roi_obj is not None: roi_obj._reg_history.append(reg_raw)
     if roi_obj is not None and roi_obj._reg_history:
         reg_score=float(np.mean(roi_obj._reg_history))
     else: reg_score=reg_raw if reg_raw is not None else 0.0
@@ -1013,6 +1028,11 @@ def compute_dynamic_roi_weight(roi, base_weight, motion_score, exposure_drift=0.
     if not (cfg.BPM_PLAUSIBLE_LOW <= roi.bpm <= cfg.BPM_PLAUSIBLE_HIGH):
         dyn_weight_factor *= cfg.ROI_BRUTAL_PENALTY
     
+    # ── Harmonic Suspicion Penalty (Petunjuk) ──────────────────────────────────
+    # If BPM is high, it's suspicious and gets a brutal penalty.
+    if roi.bpm > 115:
+        dyn_weight_factor *= 0.35
+
     # 3. BUG FIX: Soft Weighting. JANGAN ZERO OUT WEIGHT.
     # rPPG webcam realistic range: 25-40 = usable, 40-60 = good.
     # Instead of killing it, we use soft weighting.

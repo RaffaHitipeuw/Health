@@ -106,8 +106,11 @@ class PosteriorSQI:
 
 
         log_bio = 0.0
-        if peak_bpm > 130 and motion_score < 1.0:
-            log_bio = -5.0   # Was -3.0 — much stronger prior against resting tachycardia
+        # Petunjuk: HARD REJECT BPM > 130
+        if peak_bpm > 130:
+            log_bio = -10.0 # Extreme penalty (effective kill)
+        elif peak_bpm > 115 and motion_score < 1.0:
+            log_bio = -5.0   # Strong prior against resting tachycardia
 
 
         if self.roi_name == "forehead" and peak_bpm > 125:
@@ -125,11 +128,19 @@ class PosteriorSQI:
                 if peak_ratio < 1.5:
                     log_peak = -1.0
 
+        # Petunjuk: TAMBAH TEMPORAL INERTIA
+        log_temporal = 0.0
+        if len(self._sqi_history) > 0 and hasattr(self, '_last_bpm'):
+            delta_bpm = abs(peak_bpm - self._last_bpm)
+            if delta_bpm > 25:
+                log_temporal = -2.5 # Significant penalty for teleporting BPM
+        self._last_bpm = peak_bpm
+
         log_post = (
             SNR_WEIGHT           * snr_logit  +
             SPECTRAL_CONC_WEIGHT * conc_logit +
             REGULARITY_WEIGHT    * reg_logit  +
-            log_motion + log_illum + log_bio + log_peak
+            log_motion + log_illum + log_bio + log_peak + log_temporal
         )
 
 
