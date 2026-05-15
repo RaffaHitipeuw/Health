@@ -1161,10 +1161,26 @@ class MultiROIFusionEngine:
             if v.bpm>0 and not (cfg.BPM_PLAUSIBLE_LOW<=v.bpm<=cfg.BPM_PLAUSIBLE_HIGH): continue
             
             # Regularity Gate: if signal is completely irregular (reg=0), it's noise
+            # Pre-gating before normalization/fusion
             if hasattr(v, 'roi_regularity') and v.roi_regularity < cfg.REGULARITY_HARD_GATE:
+                v.dynamic_weight = 0.0
+                v.sqi = 0.0
                 continue
                 
             valid_rois[k]=v
+        
+        # Motion Rejection: Hard reject if motion is too high
+        if is_moving:
+            result.motion_rejected = True
+            result.output_frozen = True
+            # Zero out weights during motion to prevent "normalization trap"
+            for r in self.rois.values():
+                r.dynamic_weight = 0.0
+                r.sqi = 0.0
+            if not valid_rois:
+                result.roi_signals = {k: v for k, v in self.rois.items()}
+                return result
+
         if not valid_rois: result.roi_signals={k:v for k,v in self.rois.items()}; return result
         for roi_name,roi in valid_rois.items():
             arr_r=np.array(roi.buf_r); arr_g=np.array(roi.buf_g); arr_b=np.array(roi.buf_b)
@@ -1231,7 +1247,11 @@ class MultiROIFusionEngine:
                     sqi = 0.5 * sqi_cal + 0.5 * sqi_legacy
                     
                     # Hard Gate Regularity: Absolute Rejection (No Mercy)
-                    if reg_score < 15.0:
+                    # Use REG_GATE logic: if regularity is below threshold, weight is zero
+                    if reg_score < cfg.REGULARITY_HARD_GATE:
+                        sqi = 0.0
+                        roi.dynamic_weight = 0.0
+                    elif reg_score < 25.0:
                         sqi *= 0.2 # Even more brutal penalty
                         
                     roi.bpm=bpm_raw; roi.sqi=sqi; roi.roi_snr=sqi_meta.get("snr_db", 0.0); roi.roi_regularity=reg_score

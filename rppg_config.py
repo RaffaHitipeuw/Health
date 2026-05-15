@@ -32,7 +32,7 @@ class RPPGConfig:
 
     FUSION_OUTLIER_THRESHOLD: float = 8.0
 
-    REGULARITY_HARD_GATE: float = 10.0 # 0.0 survived before, now needs at least 10% regularity
+    REGULARITY_HARD_GATE: float = 15.0 # 0.0 survived before, now needs at least 15% regularity
 
     FFT_DOMINANCE_STRONG: float = 0.30
     FFT_DOMINANCE_MEDIUM: float = 0.15
@@ -135,7 +135,7 @@ class RPPGConfig:
     EMA_ALPHA_CINEMATIC: float = 0.25
     HARMONIC_SNR_RATIO: float = 0.30
     ROI_AUTO_DISABLE_SEC: int = 3
-    ROI_REG_MIN_THRESHOLD: float = 10.0
+    ROI_REG_MIN_THRESHOLD: float = 15.0
 
     BPM_EMA_ALPHA_RESEARCH: float = 0.07
     BAD_FREQS_BPM: tuple = (150.0,)

@@ -183,9 +183,10 @@ class PosteriorSQI:
         if signal is not None and len(signal) >= 30:
             from scipy.signal import correlate, butter, filtfilt
             
-            # Bandpass BEFORE regularity: 0.7 Hz - 3.0 Hz (42 - 180 BPM)
+            # Bandpass BEFORE regularity: 0.6 Hz - 4.0 Hz (Wider to preserve morphology)
+            # Lower order (2 instead of 4) to avoid over-smoothing/phase distortion
             try:
-                b, a = butter(4, [0.7 / (fps / 2), 3.0 / (fps / 2)], btype='band')
+                b, a = butter(2, [0.6 / (fps / 2), 4.0 / (fps / 2)], btype='band')
                 sig_clean = filtfilt(b, a, signal)
             except:
                 sig_clean = signal
@@ -197,17 +198,26 @@ class PosteriorSQI:
             acf = correlate(sig_norm, sig_norm, mode='full')[n-1:]
             acf = acf / (acf[0] + 1e-12) # Normalize by zero-lag
             
-            # Find the second peak in physiological lag (42-180 BPM)
-            lag_min = int(fps * 60 / 180) # ~0.33s
-            lag_max = int(fps * 60 / 42)  # ~1.42s
+            # Find the second peak in physiological lag (40-190 BPM)
+            lag_min = int(fps * 60 / 190) # ~0.31s
+            lag_max = int(fps * 60 / 40)  # ~1.50s
             
             if len(acf) > lag_min:
                 # Limit search to physiological range
                 acf_search = acf[lag_min:min(len(acf), lag_max)]
                 if len(acf_search) > 0:
-                    acf_peak = float(np.max(acf_search))
-                    # Smooth scoring: (acf_peak - 0.2) / 0.6
-                    reg_acf = float(np.clip((acf_peak - 0.2) / 0.6, 0.0, 1.0))
+                    # Instead of just max, look for a local maximum (peak)
+                    # This prevents picking a value from a descending slope
+                    from scipy.signal import find_peaks as scipy_find_peaks
+                    peaks, props = scipy_find_peaks(acf_search, height=0.1)
+                    if len(peaks) > 0:
+                        acf_peak = float(np.max(props['peak_heights']))
+                    else:
+                        acf_peak = float(np.max(acf_search)) * 0.5 # Penalty for no clear peak
+                    
+                    # More generous scoring: (acf_peak - 0.15) / 0.5
+                    # Biological signals are messy, don't expect 0.8+ ACF
+                    reg_acf = float(np.clip((acf_peak - 0.15) / 0.5, 0.0, 1.0))
         
         # Combined Regularity: Prioritize ACF for waveform shape, CV for timing
         combined_reg = 0.7 * reg_acf + 0.3 * reg_peaks
