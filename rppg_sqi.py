@@ -291,6 +291,14 @@ class BayesianROIWeighting:
             # Petunjuk menyarankan np.exp(-diff / 12) untuk agreement brutal.
             bpm_agreement = float(np.exp(-abs(bpm - fused_bpm) / 12.0))
             
+            # ── Subharmonic / Half-Frequency Lock (Petunjuk) ───────────────────────
+            # If ROI BPM is ~0.5x of fused BPM, it's a subharmonic artifact.
+            # Petunjuk: 0.45 < bpm / stable < 0.55 -> penalty *= 0.4
+            if fused_bpm > 0:
+                ratio = bpm / fused_bpm
+                if 0.45 < ratio < 0.55:
+                    bpm_agreement *= 0.4
+            
 
 
             physio_validity = 1.0

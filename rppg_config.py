@@ -146,6 +146,11 @@ class RPPGConfig:
     PEAK_PERSISTENCE_LIMIT: int = 150 # Frames before we suspect peak locking
     PEAK_PERSISTENCE_BPM_TOL: float = 1.0
 
+    # ── Subharmonic / Half-Frequency Lock (Petunjuk) ───────────────────────────
+    SUBHARMONIC_RATIO_LOW: float = 0.45
+    SUBHARMONIC_RATIO_HIGH: float = 0.55
+    SUBHARMONIC_PENALTY: float = 0.4
+
     # ── Harmonic Zombie System ─────────────────────────────────────────────────
     # Consecutive frames at 2:1 ratio before full zombie lock
     ZOMBIE_LOCK_FRAMES: int = 5

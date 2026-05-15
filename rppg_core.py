@@ -806,7 +806,17 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
         if abs(peak_bpm - last_bpm) > 25:
             temporal_inertia_mult = 0.4
 
-    bio_penalty = physio_prior * sine_purity_mult * temporal_inertia_mult
+    # ── Subharmonic / Half-Frequency Lock (Petunjuk) ──────────────────────────
+    # If this ROI's BPM is ~0.5x of a stable fused BPM, it's likely a subharmonic lock.
+    subharmonic_mult = 1.0
+    # We use a persistent stable BPM from the smoother if available
+    stable_bpm = getattr(roi_obj, '_last_stable_fused_bpm', 0.0)
+    if stable_bpm > 0:
+        ratio = peak_bpm / stable_bpm
+        if cfg.SUBHARMONIC_RATIO_LOW < ratio < cfg.SUBHARMONIC_RATIO_HIGH:
+            subharmonic_mult = cfg.SUBHARMONIC_PENALTY
+
+    bio_penalty = physio_prior * sine_purity_mult * temporal_inertia_mult * subharmonic_mult
 
     sig=signal-np.mean(signal); sig=scipy_detrend(sig,type="linear")
     n=len(sig); fft_v=np.abs(np.fft.rfft(sig*np.hanning(n)))**2
@@ -1551,6 +1561,12 @@ class MultiROIFusionEngine:
 
         roi_sqis = {n: r.sqi for n, r, _ in roi_items_final}
         roi_bpms = {n: r.bpm for n, r, _ in roi_items_final}
+        
+        # Pass fused_bpm to ROIs for subharmonic detection in next frame
+        for n, r, _ in roi_items_final:
+            if fused_bpm_raw > 0:
+                r._last_stable_fused_bpm = fused_bpm_raw
+
         self.learned_weighting.update_weights(roi_sqis, fused_bpm_raw, roi_bpms)
 
 
