@@ -112,7 +112,8 @@ class BayesianBPMTracker:
             self._predict()
             return float(np.dot(self.bpm_range, self.prior))
 
-        sigma = 15.0 * (1.0 - np.clip(sqi / 100.0, 0.0, 1.0)) + 2.0
+        # Reduced base sigma and SQI scaling to make tracker more responsive to new measurements
+        sigma = 10.0 * (1.0 - np.clip(sqi / 100.0, 0.0, 1.0)) + 1.5
 
 
         likelihood = np.exp(-0.5 * ((self.bpm_range - measured_bpm) / sigma)**2)
@@ -191,7 +192,8 @@ class ProbabilisticFusion:
             if bpm <= 0 or sqi < 0:
                 continue
 
-            sigma = 15.0 * (1.0 - np.clip(sqi / 100.0, 0.0, 1.0)) + 1.0
+            # Reduced sigma for fusion to trust current ROI estimates more
+            sigma = 10.0 * (1.0 - np.clip(sqi / 100.0, 0.0, 1.0)) + 0.8
             log_lik = -0.5 * ((self.tracker.bpm_range - bpm) / sigma)**2
             log_joint += log_lik
 

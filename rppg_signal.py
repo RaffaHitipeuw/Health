@@ -35,8 +35,8 @@ def mature_harmonic_rejection(psd, freqs, peak_hz, threshold=0.15):
     # If we are at 144 BPM, check 72 BPM (f/2) and 48 BPM (f/3)
     sub_harmonics = [peak_hz / 2.0, peak_hz / 3.0]
     
-    # Aggressive threshold for high BPMs (Zombie 144 BPM fix)
-    sub_energy_threshold = 0.25 if peak_bpm > 130 else 0.40
+    # Relaxed threshold to prevent over-rejection
+    sub_energy_threshold = 0.40 if peak_bpm > 140 else 0.60
     
     for sub_h in sub_harmonics:
         if sub_h < 0.7: # Below 42 BPM

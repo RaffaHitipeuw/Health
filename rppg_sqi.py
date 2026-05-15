@@ -108,20 +108,22 @@ class PosteriorSQI:
         log_bio = 0.0
         # Petunjuk: HARD REJECT BPM > 130
         # Petunjuk: JANGAN kasih 140+ lolos kecuali confidence brutal.
-        if peak_bpm > 135:
-            log_bio = -15.0 # Total Reject
+        if peak_bpm > 145:
+            log_bio = -8.0 # Gradual penalty instead of -15
+        elif peak_bpm > 135:
+            log_bio = -5.0
         elif peak_bpm > 130:
-            log_bio = -10.0 # Extreme penalty (effective kill)
+            log_bio = -3.0 # Extreme penalty (effective kill)
         elif peak_bpm > 115 and motion_score < 1.0:
-            log_bio = -5.0   # Strong prior against resting tachycardia
+            log_bio = -2.0   # Strong prior against resting tachycardia
 
-        # Petunjuk: Harmonic/Subharmonic relation penalty
+        # Petunjuk: Harmonic/Subharmonic relation penalty (KEEMPAT: HARMONIC FILTER)
         if hasattr(self, '_last_stable_fused_bpm') and self._last_stable_fused_bpm > 0:
             ratio = peak_bpm / self._last_stable_fused_bpm
             if 1.8 < ratio < 2.2:
-                log_bio -= 4.0 # Heavy harmonic penalty
+                log_bio -= 2.5 # Harmonic penalty
             elif 0.45 < ratio < 0.55:
-                log_bio -= 4.0 # Heavy subharmonic penalty
+                log_bio -= 2.0 # Subharmonic penalty
 
 
         if self.roi_name == "forehead" and peak_bpm > 125:
@@ -144,11 +146,18 @@ class PosteriorSQI:
                     log_peak = -1.5 # Weak peak dominance penalty
 
         # Petunjuk: TAMBAH TEMPORAL INERTIA
+        # ── BPM Temporal Inertia (PRIORITAS #3 — SQI layer) ───────────────────
+        # Ini adalah inertia di level SQI (posterior), melengkapi inertia di rppg_core.
+        # Heart rate tidak teleport. Penalty makin keras seiring besarnya loncatan.
         log_temporal = 0.0
         if len(self._sqi_history) > 0 and hasattr(self, '_last_bpm'):
             delta_bpm = abs(peak_bpm - self._last_bpm)
-            if delta_bpm > 25:
-                log_temporal = -2.5 # Significant penalty for teleporting BPM
+            if delta_bpm > 30:
+                log_temporal = -6.0  # Nuclear: jump > 30 BPM = artifact
+            elif delta_bpm > 20:
+                log_temporal = -4.0  # Brutal: very unlikely physiologically
+            elif delta_bpm > 12:
+                log_temporal = -2.5  # Significant penalty for suspicious jump
         self._last_bpm = peak_bpm
 
         log_post = (
@@ -316,11 +325,13 @@ class BayesianROIWeighting:
                 elif 1.8 < ratio < 2.2:
                     bpm_agreement *= 0.3 # Even heavier for harmonic zombie lock
             
-            # ── Strict BPM Gating (Petunjuk) ──────────────────────────────────────
-            if bpm > 135:
-                bpm_agreement *= 0.05
+            # ── Strict BPM Gating (Petunjuk: JANGAN ZERO OUT) ──────────────────────
+            if bpm > 145:
+                bpm_agreement *= 0.15
+            elif bpm > 135:
+                bpm_agreement *= 0.30
             elif bpm > 130:
-                bpm_agreement *= 0.20
+                bpm_agreement *= 0.50
             
 
 

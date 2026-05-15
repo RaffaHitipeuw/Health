@@ -93,6 +93,7 @@ class ROISignal:
 
     _bad_streak: int = 0
     _excluded_until: int = 0
+    _prev_bpm: float = 0.0          # BPM inertia tracking (last accepted BPM)
 
     def clear(self):
         self.buf_r.clear(); self.buf_g.clear(); self.buf_b.clear()
@@ -400,7 +401,7 @@ class MotionArtifactDetector:
         self.is_moving     = False
         self.grace_counter = 0
         self._score_ema    = 0.0
-        self._ema_alpha    = 0.35
+        self._ema_alpha    = 0.50
         self._slow_ema     = 0.0
         self._slow_alpha   = 0.04
         self._prev_raw     = 0.0
@@ -768,12 +769,14 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
     # ── Strict BPM Gating (Petunjuk) ───────────────────────────────────
     # Petunjuk: JANGAN kasih 140+ lolos kecuali confidence brutal.
     # if bpm > 130: sqi *= 0.25. if bpm > 135: reject.
-    if peak_bpm > 135:
-        physio_prior = 0.0  # REJECT total
+    if peak_bpm > 160:
+        physio_prior = 0.1 # Relaxed from 0.05
+    elif peak_bpm > 145:
+        physio_prior = 0.3
     elif peak_bpm > 130:
-        physio_prior = 0.25 # Severe penalty
-    elif roi_name == "forehead" and peak_bpm > 115:
-        physio_prior = 0.4
+        physio_prior = 0.5 # Relaxed from 0.35
+    elif roi_name == "forehead" and peak_bpm > 120:
+        physio_prior = 0.6 # Relaxed from 0.4
     elif peak_bpm > cfg.PHYSIO_PRIOR_HIGH_BPM_THRESH and motion_score < cfg.PHYSIO_PRIOR_MOTION_EXEMPT:
         physio_prior = cfg.PHYSIO_PRIOR_HIGH_BPM_SQI_MULT
     elif peak_bpm > cfg.PHYSIO_PRIOR_ELEV_BPM_THRESH and motion_score < cfg.PHYSIO_PRIOR_MOTION_EXEMPT:
@@ -813,16 +816,17 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
                    (cfg.SUBHARMONIC_RATIO_LOW < ratio < cfg.SUBHARMONIC_RATIO_HIGH):
                     temporal_inertia_mult = 0.2 # Even heavier penalty for harmonic jumps
 
-    # ── Harmonic / Subharmonic Relation (Petunjuk) ──────────────────────────
+    # ── Harmonic / Subharmonic Relation (KEEMPAT: HARMONIC FILTER) ──────────
     # If this ROI's BPM is ~0.5x or ~2x of a stable fused BPM, it's likely a lock.
     harmonic_relation_mult = 1.0
     stable_bpm = getattr(roi_obj, '_last_stable_fused_bpm', 0.0)
     if stable_bpm > 0:
         ratio = peak_bpm / stable_bpm
-        if cfg.SUBHARMONIC_RATIO_LOW < ratio < cfg.SUBHARMONIC_RATIO_HIGH:
-            harmonic_relation_mult = cfg.SUBHARMONIC_PENALTY
-        elif cfg.HARMONIC_RATIO_LOW < ratio < cfg.HARMONIC_RATIO_HIGH:
-            harmonic_relation_mult = cfg.HARMONIC_PENALTY
+        # ratio = candidate / stable_bpm
+        if 1.8 < ratio < 2.2:
+            harmonic_relation_mult = cfg.HARMONIC_PENALTY # harmonic_penalty
+        elif 0.45 < ratio < 0.55:
+            harmonic_relation_mult = cfg.SUBHARMONIC_PENALTY # subharmonic_penalty
 
     bio_penalty = physio_prior * sine_purity_mult * temporal_inertia_mult * harmonic_relation_mult
 
@@ -915,11 +919,12 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
     
     current_inst_stability = 1.0
     if roi_obj is not None and len(roi_obj._bpm_history) >= 5:
-        # ── Stability Recovery (Petunjuk) ──────────────────────────────────
-        # Relaxed from 5.0 to 3.0 multiplier to prevent stability from collapsing to 0%
-        # during normal physiological heart rate variability.
-        hist = list(roi_obj._bpm_history)[-10:]; bpm_std = np.std(hist); bpm_mean = np.mean(hist)
-        current_inst_stability = max(0.0, 1.0 - (bpm_std / (bpm_mean + 1e-9)) * 3.0)
+        # ── Stability Score (KELIMA: ROLLING WINDOW) ───────────────────────
+        # stability = max(0, 100 - std * K)
+        hist = list(roi_obj._bpm_history)[-10:]
+        bpm_std = np.std(hist)
+        K = 4.0 # Sensitivity constant
+        current_inst_stability = max(0.0, (100.0 - bpm_std * K) / 100.0)
     
 
     temp_stability = prev_stability * 0.9 + current_inst_stability * 0.1
@@ -955,14 +960,14 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
     lighting_penalty=0.0
     if bref<50: lighting_penalty=min((50-bref)/50.0, cfg.SQI_MAX_LIGHTING_PENALTY)
     elif bref>210: lighting_penalty=min((bref-210)/40.0, cfg.SQI_MAX_LIGHTING_PENALTY)
-    if exposure_drift > cfg.EXPOSURE_DRIFT_WARN:
-        drift_ratio = min((exposure_drift - cfg.EXPOSURE_DRIFT_WARN) / (cfg.EXPOSURE_DRIFT_FREEZE - cfg.EXPOSURE_DRIFT_WARN), 1.0)
-        # If drift is near freeze threshold, force heavy penalty (Petunjuk: JANGAN 0.9 langsung)
-        if exposure_drift > cfg.EXPOSURE_DRIFT_FREEZE * 0.9:
-            lighting_penalty = 0.6 # Relaxed from 0.9
-        else:
-            drift_sqi_pen = drift_ratio * cfg.EXPOSURE_DRIFT_SQI_PENALTY
-            lighting_penalty = min(lighting_penalty + drift_sqi_pen, cfg.SQI_MAX_LIGHTING_PENALTY)
+    if exposure_drift > 10:
+        lighting_penalty = 0.3
+    if exposure_drift > 20:
+        lighting_penalty = 0.5
+    if exposure_drift > 30:
+        lighting_penalty = 0.7
+    if exposure_drift > 40:
+        lighting_penalty = 0.9
 
     weighted_score = (
         cfg.SQI_WEIGHT_SNR * snr_score +
@@ -987,10 +992,10 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
     # Petunjuk: stab=0% peak=98% -> REJECT.
     # If peak is high but stability is zero, it's a spectral spike artifact.
     # current_inst_stability is already calculated above.
-    if current_inst_stability < 0.10 and peak_consistency > 0.85:
+    if current_inst_stability < 0.05 and peak_consistency > 0.90:
         # Nuclear nuke for suspicious isolated spectral spikes
-        bio_penalty *= 0.05 # Even more brutal
-        if roi_obj: roi_obj.agreement_factor *= 0.1
+        bio_penalty *= 0.4 # Relaxed from 0.2
+        if roi_obj: roi_obj.agreement_factor *= 0.5
 
     overall=raw*100.0 * bio_penalty
     # NOTE: bio_penalty (physiological prior × sinusoidal purity) is applied BEFORE
@@ -1040,59 +1045,62 @@ def compute_dynamic_roi_weight(roi, base_weight, motion_score, exposure_drift=0.
     if zombie_streak >= cfg.ZOMBIE_LOCK_FRAMES or getattr(roi, 'is_harmonic_suspect', False):
         return 0.0
 
-    snr_val=roi.roi_snr
+    # ── PHYSIOLOGICAL SCORE (KEDUA: DYNAMIC WEIGHT) ────────────────────────────
+    phys_score = 1.0
+    if roi.bpm > 0:
+        if roi.bpm < 45 or roi.bpm > 150:
+            phys_score *= 0.1
+        elif roi.bpm < 55 or roi.bpm > 130:
+            phys_score *= 0.5 # Relaxed from 0.2
+    
+    stable_bpm = getattr(roi, '_last_stable_fused_bpm', 0.0)
+    if stable_bpm > 0 and abs(roi.bpm - stable_bpm) > 25:
+        phys_score *= 0.6 # Relaxed from 0.5
 
-
-    if snr_val < cfg.SNR_KILL_THRESHOLD:
-        snr_score = cfg.SNR_KILL_WEIGHT + (1.0 - cfg.SNR_KILL_WEIGHT) * np.exp(-3.0 * (cfg.SNR_KILL_THRESHOLD - snr_val) / (cfg.SNR_KILL_THRESHOLD + 1e-9))
-    else: snr_score = min((snr_val / 100.0) ** 1.5, 1.0)
-    temp_stab = 1.0
+    # ── TEMPORAL SCORE ─────────────────────────────────────────────────────────
+    temporal_score = 1.0
     if len(roi._bpm_history) >= 5:
-        bpm_std = np.std(roi._bpm_history); temp_stab = max(0.1, 1.0 - (bpm_std / 10.0))
-    af = roi.agreement_factor
+        hist = list(roi._bpm_history)[-10:]
+        bpm_std = np.std(hist)
+        temporal_score = max(0.1, 1.0 - (bpm_std / 20.0)) # Floor at 0.1, relaxed std
 
-    if af < cfg.AGREEMENT_KILL_BELOW:
-        agr_score = cfg.AGREEMENT_KILL_MULT + (af / (cfg.AGREEMENT_KILL_BELOW + 1e-9)) * (cfg.AGREEMENT_KILL_BELOW - cfg.AGREEMENT_KILL_MULT)
-    else: agr_score = af
+    # ── SQI NORM ───────────────────────────────────────────────────────────────
+    # Ensure sqi_norm has a baseline even at start
+    sqi_norm = max(0.1, roi.sqi / 100.0)
 
-
-    history_score = temp_stab
-    dyn_weight_factor = (snr_score * 0.5 + agr_score * 0.3 + history_score * 0.2)
+    # ── DYNAMIC WEIGHT FORMULA (KEDUA) ─────────────────────────────────────────
+    # final_weight = raw_weight * phys_score
+    snr_val = roi.roi_snr
+    snr_score = min((snr_val / 100.0) ** 1.5, 1.0) if snr_val > 0 else 0.1
+    
+    raw_weight = (sqi_norm * 0.4 + temporal_score * 0.4 + snr_score * 0.2)
+    dyn_weight_factor = raw_weight * phys_score
     
     # Hard suppression for outliers and bad signals
     if not (cfg.BPM_PLAUSIBLE_LOW <= roi.bpm <= cfg.BPM_PLAUSIBLE_HIGH):
         dyn_weight_factor *= cfg.ROI_BRUTAL_PENALTY
     
-    # ── Harmonic Suspicion Penalty (Petunjuk) ──────────────────────────────────
-    # If BPM is high, it's suspicious and gets a brutal penalty.
-    if roi.bpm > 115:
-        dyn_weight_factor *= 0.35
+    # ── Brightness Penalty (PRIORITAS #2) ─────────────────────────────────────
+    # Low brightness = sensor noise dominates. Signal darí ROI gelap tidak bisa dipercaya.
+    # forehead bright=57 adalah contoh: SNR palsu, BPM ngawur, stability jeblok.
+    brightness = getattr(roi, 'roi_brightness', 128.0)
+    if brightness < 65:
+        # Very dark: unreliable signal, heavy penalty
+        dyn_weight_factor *= max(0.08, (brightness / 65.0) ** 2)
+    elif brightness < 85:
+        # Moderately dark: soft penalty
+        dyn_weight_factor *= max(0.35, brightness / 85.0)
 
-    # ── Hard SQI Reject (Petunjuk) ─────────────────────────────────────────────
-    # If SQI is too low, reject the ROI completely.
-    if roi.sqi < 10.0:
-        return 0.0 # Hard reject
-
-    # ── Brutal Low SQI Penalty (Petunjuk) ──────────────────────────────────────
-    # If SQI is low, apply a brutal penalty.
-    if roi.sqi < 15.0:
-        dyn_weight_factor *= 0.05
-
-    # 3. BUG FIX: Soft Weighting. JANGAN ZERO OUT WEIGHT.
-    # rPPG webcam realistic range: 25-40 = usable, 40-60 = good.
-    # Instead of killing it, we use soft weighting.
-    if roi.sqi < 25.0 or roi.roi_regularity < 10.0:
-        dyn_weight_factor *= 0.1 # Soft penalty instead of 0.0
-    
     # Motion still needs some suppression but maybe not total kill if it's brief
     if motion_score > cfg.MOTION_ENTER_THRESHOLD:
-        dyn_weight_factor *= 0.05
+        dyn_weight_factor *= 0.2 # Relaxed from 0.05
         
     weight = base_weight * dyn_weight_factor
 
     
 
 
+    af = roi.agreement_factor
     if af < cfg.AGREEMENT_KILL_BELOW:
         weight *= cfg.ROI_BRUTAL_PENALTY
     if motion_score > 3.5: weight *= 0.5
@@ -1318,7 +1326,12 @@ class MultiROIFusionEngine:
             if v.skin_coverage < _sc_min: continue
             if v.roi_brightness<cfg.ROI_BRIGHTNESS_MIN or v.roi_brightness>cfg.ROI_BRIGHTNESS_MAX: continue
 
-            if v.bpm>0 and not (cfg.BPM_PLAUSIBLE_LOW<=v.bpm<=cfg.BPM_PLAUSIBLE_HIGH): continue
+            if v.bpm>0 and not (cfg.BPM_PLAUSIBLE_LOW<=v.bpm<=cfg.BPM_PLAUSIBLE_HIGH):
+                # BUG FIX: Reset stale dynamic_weight agar display tidak misleading.
+                # ROI yang diskip karena BPM absurd HARUS menampilkan weight=0,
+                # bukan weight lama yang masih keliatan tinggi di debug output.
+                v.dynamic_weight = 0.0
+                continue
             
             # Regularity Gate: if signal is completely irregular (reg=0), it's noise
             # Pre-gating before normalization/fusion
@@ -1421,6 +1434,21 @@ class MultiROIFusionEngine:
                     elif reg_score < 25.0:
                         sqi *= 0.2 # Even more brutal penalty
                         
+                    # ── BPM INERTIA GATE (PRIORITAS #3) ─────────────────────────────────
+                    # Heart rate manusia tidak teleport. 84 → 148 → 57 → 102 dalam 4 detik = noise.
+                    # Penalty progressif: makin besar loncatan, makin hancur SQI-nya.
+                    if bpm_raw > 0 and roi._prev_bpm > 0:
+                        bpm_delta = abs(bpm_raw - roi._prev_bpm)
+                        if bpm_delta > 30:
+                            sqi *= 0.20   # Nuclear: literally impossible jump
+                        elif bpm_delta > 20:
+                            sqi *= 0.40   # Brutal: sangat tidak physiologis
+                        elif bpm_delta > 12:
+                            sqi *= 0.65   # Moderate: suspicious
+                    # Update prev_bpm hanya jika signal cukup credible
+                    if bpm_raw > 0 and sqi >= 15.0:
+                        roi._prev_bpm = bpm_raw
+
                     roi.bpm=bpm_raw; roi.sqi=sqi; roi.roi_snr=sqi_meta.get("snr_db", 0.0); roi.roi_regularity=reg_score
                     if bpm_raw>0: 
                         roi._bpm_history.append(bpm_raw)
@@ -1456,18 +1484,34 @@ class MultiROIFusionEngine:
             self.panting_adapter.update(best_bpm, _physio.state)
         result.in_calibration=self.calibration.update(best_sqi,best_bpm)
 
-        candidates = {k: v for k, v in valid_rois.items() if BPM_LOW <= v.bpm <= BPM_HIGH and v.sqi >= SQI_HARD_GATE}
+        # ── Candidate Selection: Physio gate DULU, baru BPM_HIGH ─────────────────
+        # BUG FIX: BPM_HIGH = 180 terlalu permisif. Gunakan BPM_PLAUSIBLE_HIGH = 135
+        # sebagai primary gate. BPM 148.7 pada orang diem = artifact, bukan signal.
+        candidates = {k: v for k, v in valid_rois.items()
+                      if BPM_LOW <= v.bpm <= cfg.BPM_PLAUSIBLE_HIGH and v.sqi >= SQI_HARD_GATE}
         if not candidates:
-
+            # Second chance: relax SQI gate tapi tetap physio-gated
+            candidates = {k: v for k, v in valid_rois.items()
+                          if BPM_LOW <= v.bpm <= cfg.BPM_PLAUSIBLE_HIGH}
+        if not candidates:
+            # Last resort: allow up to BPM_HIGH but dengan catatan ini sudah suspect
             candidates = {k: v for k, v in valid_rois.items() if BPM_LOW <= v.bpm <= BPM_HIGH}
         if not candidates: result.roi_signals={k:v for k,v in self.rois.items()}; return result
-        ref_roi = max(candidates.values(), key=lambda r: r.sqi); ref_bpm = ref_roi.bpm
+
+        # ── ref_roi: prefer physiologically plausible BPM ──────────────────────
+        # BUG FIX: ref_roi fallback dulu cari yang physio valid.
+        # Jangan kasih zombie BPM 148.7 jadi ref hanya karena SQI-nya tinggi.
+        phys_candidates = {k: v for k, v in candidates.items()
+                           if cfg.BPM_PLAUSIBLE_LOW <= v.bpm <= cfg.BPM_PLAUSIBLE_HIGH}
+        ref_pool = phys_candidates if phys_candidates else candidates
+        ref_roi = max(ref_pool.values(), key=lambda r: r.sqi); ref_bpm = ref_roi.bpm
         HARD_OUTLIER = cfg.FUSION_OUTLIER_THRESHOLD + 10.0; candidates = {k: v for k, v in candidates.items() if abs(v.bpm - ref_bpm) <= HARD_OUTLIER}
         if not candidates: candidates = {ref_roi.name: ref_roi}
 
 
         # BUG FIX: Median BPM. Use SQI-weighted median if possible to avoid 144 BPM pulling the median.
         all_valid_items = [(r.bpm, r.sqi) for r in valid_rois.values() if r.bpm > 0]
+        all_valid_bpms = [x[0] for x in all_valid_items]
         if not all_valid_items:
             median_bpm = 0.0
         else:

@@ -184,8 +184,8 @@ class BayesianHREstimator:
         
         # BUG FIX: Session confidence stuck at 0.0%. 
         # Ensure it can actually grow but decays fast if conditions are bad.
-        if len(self._bpm_history) < 30: # Minimum window for "real" confidence
-            confidence *= (len(self._bpm_history) / 30.0)
+        if len(self._bpm_history) < 15: # Reduced warmup window
+            confidence *= (len(self._bpm_history) / 15.0)
 
 
         return HeartRateEstimate(

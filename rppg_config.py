@@ -40,7 +40,7 @@ class RPPGConfig:
 
     HARMONIC_BPM_THRESHOLD: float = 130.0
     HARMONIC_PROXIMITY_TOL: float = 5.0
-    TEMPORAL_INERTIA_ALPHA: float = 0.15
+    TEMPORAL_INERTIA_ALPHA: float = 0.30
     MAX_BPM_JUMP: float = 10.0
 
     BPM_VELOCITY_SOFT_LIMIT: float = 3.0
@@ -69,7 +69,11 @@ class RPPGConfig:
     AGREEMENT_DEV_K: float = 6.0
 
     BPM_PLAUSIBLE_LOW: float = 45.0
-    BPM_PLAUSIBLE_HIGH: float = 135.0
+    BPM_PLAUSIBLE_HIGH: float = 130.0    # TUNED: 135→130. Manusia duduk diem jarang >130.
+    # BPM Inertia thresholds — shared antara rppg_core dan rppg_sqi
+    BPM_INERTIA_NUCLEAR: float = 30.0    # Jump > 30 BPM = almost certainly artifact
+    BPM_INERTIA_BRUTAL: float = 20.0     # Jump > 20 BPM = very suspicious
+    BPM_INERTIA_SOFT: float = 12.0       # Jump > 12 BPM = mild penalty
 
     SINGLE_ROI_SQI_MULT: float = 1.00
 
@@ -98,7 +102,7 @@ class RPPGConfig:
     BPM_HOLDOVER_SEC: float = 5.0
     MOTION_GRACE_FRAMES: int = 20
 
-    BPM_EMA_ALPHA: float = 0.10
+    BPM_EMA_ALPHA: float = 0.25
     BPM_MEDIAN_WINDOW: int = 17
     BPM_MAX_JUMP: float = 12.0
 
@@ -130,14 +134,14 @@ class RPPGConfig:
     TEMPORAL_ANCHOR_TAU: float = 10.0
     TEMPORAL_MAX_DELTA: float = 15.0
     HARMONIC_PENALTY_MULT: float = 0.15
-    SESSION_CONF_ALPHA: float = 0.10
+    SESSION_CONF_ALPHA: float = 0.25
     SESSION_CONF_HARD_REJECT_DECAY: float = 0.85
     EMA_ALPHA_CINEMATIC: float = 0.25
     HARMONIC_SNR_RATIO: float = 0.30
     ROI_AUTO_DISABLE_SEC: int = 3
     ROI_REG_MIN_THRESHOLD: float = 15.0
 
-    BPM_EMA_ALPHA_RESEARCH: float = 0.07
+    BPM_EMA_ALPHA_RESEARCH: float = 0.25
     BAD_FREQS_BPM: tuple = (150.0,)
     PEAK_PROMINENCE_MIN: float = 0.40
     CONSENSUS_STD_MAX: float = 8.0
