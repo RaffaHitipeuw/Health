@@ -866,13 +866,18 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
 
 
     # Hard Propagation of Detector State
+    # Sync with Motion Detector REJECT state
     motion_penalty = 0.0
     if motion_score > cfg.MOTION_EXIT_THRESHOLD:
         motion_penalty = min((motion_score - cfg.MOTION_EXIT_THRESHOLD) / 4.0, cfg.SQI_MAX_MOTION_PENALTY)
         
+        # If motion detector says REJECT, motion_penalty MUST NOT be zero.
         # Hard rejection: if detector says REJECT, force penalty to 1.0
         if motion_score > cfg.MOTION_ENTER_THRESHOLD:
             motion_penalty = 1.0 # Brutal penalty for REJECT state
+        else:
+            # Even if not REJECT, ensure a minimum penalty if above exit threshold
+            motion_penalty = max(motion_penalty, 0.3)
 
         if hasattr(roi_obj, 'motion_penalty'):
             motion_penalty = min(1.0, motion_penalty + roi_obj.motion_penalty)
@@ -963,8 +968,9 @@ def compute_dynamic_roi_weight(roi, base_weight, motion_score, exposure_drift=0.
     if not (cfg.BPM_PLAUSIBLE_LOW <= roi.bpm <= cfg.BPM_PLAUSIBLE_HIGH):
         dyn_weight_factor *= cfg.ROI_BRUTAL_PENALTY
     
-    # Pre-gating: Kill weight if SQI or regularity is too low
-    if roi.sqi < cfg.SQI_HARD_GATE or roi.roi_regularity < cfg.REGULARITY_HARD_GATE:
+    # 3. Absolute Rejection (No Winner Policy): Fix Normalization Trap
+    # If SQI < 45% or regularity < 15%, the ROI is "goblok" - kill it before normalization.
+    if roi.sqi < 45.0 or roi.roi_regularity < 15.0:
         dyn_weight_factor = 0.0
     
     # Kill weight if motion is in REJECT state
@@ -1214,10 +1220,19 @@ class MultiROIFusionEngine:
                     
                     sqi = 0.5 * sqi_cal + 0.5 * sqi_legacy
                     
-                    # Hard Gate Regularity: SQI *= 0.4 if reg < 15
+                    # 1. Peak-Regularity Coupling: Spectral peak without temporal periodicity is a scam.
                     reg_score = sqi_meta.get("regularity_score", 0.0) * 100.0
+                    
+                    # Couple peak confidence with regularity
+                    if reg_score < 20.0:
+                        sqi_cal *= (reg_score / 20.0)
+                        sqi_legacy *= 0.5
+                    
+                    sqi = 0.5 * sqi_cal + 0.5 * sqi_legacy
+                    
+                    # Hard Gate Regularity: Absolute Rejection (No Mercy)
                     if reg_score < 15.0:
-                        sqi *= 0.4
+                        sqi *= 0.2 # Even more brutal penalty
                         
                     roi.bpm=bpm_raw; roi.sqi=sqi; roi.roi_snr=sqi_meta.get("snr_db", 0.0); roi.roi_regularity=reg_score
                     if bpm_raw>0: 
@@ -1267,11 +1282,14 @@ class MultiROIFusionEngine:
         all_valid_bpms = [r.bpm for r in valid_rois.values() if r.bpm > 0]
         median_bpm = float(np.median(all_valid_bpms)) if all_valid_bpms else 0.0
         
-        # Spread-based consensus: if ROIs are on "different planets", penalize everything
+        # 2. Cross-ROI Coherence Validation: Pulse is a global vascular rhythm.
+        # If ROIs are on "different planets", it's likely noise (which rarely syncs).
         spread = max(all_valid_bpms) - min(all_valid_bpms) if len(all_valid_bpms) >= 2 else 0.0
         global_consensus_penalty = 1.0
-        if spread > 15.0:
-            global_consensus_penalty = max(0.2, 1.0 - (spread - 15.0) / 30.0)
+        if spread > 12.0:
+            # ROI spread > 12 BPM: Downgrade confidence globaly
+            global_consensus_penalty = max(0.1, 1.0 - (spread - 12.0) / 20.0)
+            result.roi_conflict = True
 
         for roi in candidates.values():
             # Distance from median of ALL ROIs, not just candidates
@@ -1375,23 +1393,31 @@ class MultiROIFusionEngine:
             result.fused_bpm = self._frozen_bpm
             result.bpm_locked = True
         elif fused_bpm_raw > 0:
-            # Hard State Propagation: If motion is REJECTED, do not update temporal memory
-            if motion_score > cfg.MOTION_ENTER_THRESHOLD:
+            # 4. Temporal Memory Protection: Freeze if motion or ROI conflict is too high.
+            # Humans don't teleport, and noise shouldn't "teach" the system.
+            prev_fused = self._frozen_bpm if self._frozen_bpm > 0 else fused_bpm_raw
+            
+            # ROI Disagreement Freeze: If spread > 15 BPM, don't update memory.
+            all_bpms = [r.bpm for r in valid_rois.values() if r.bpm > 0]
+            roi_spread = max(all_bpms) - min(all_bpms) if len(all_bpms) >= 2 else 0.0
+            
+            if motion_score > cfg.MOTION_ENTER_THRESHOLD or roi_spread > 15.0:
                 result.fused_bpm = self._frozen_bpm
                 result.bpm_locked = True
             else:
-                # Temporal Physiological Anchor
-                prev_fused = self._frozen_bpm if self._frozen_bpm > 0 else fused_bpm_raw
+                # 5. Physiological Rate-of-Change Limiter
                 delta_bpm = abs(fused_bpm_raw - prev_fused)
-                temporal_penalty = 1.0
-                if delta_bpm > cfg.TEMPORAL_MAX_DELTA:
-                    temporal_penalty = float(np.exp(-delta_bpm / cfg.TEMPORAL_ANCHOR_TAU))
+                trust_penalty = 1.0
+                if delta_bpm > 15.0:
+                    # Exponential decay for trust if change > 15 BPM
+                    trust_penalty = float(np.exp(-(delta_bpm - 15.0) / 10.0))
                 
                 # Temporal Fusion Memory (Inertia)
                 # Humans don't teleport. 0.8 * prev + 0.2 * current
                 fused_bpm_raw_inertia = 0.8 * prev_fused + 0.2 * fused_bpm_raw
                 
-                fused_bpm_raw_anchored = fused_bpm_raw_inertia * temporal_penalty + prev_fused * (1.0 - temporal_penalty)
+                # Combine inertia with rate-of-change trust
+                fused_bpm_raw_anchored = fused_bpm_raw_inertia * trust_penalty + prev_fused * (1.0 - trust_penalty)
                 
                 smoothed=self.bpm_smoother.update(fused_bpm_raw_anchored); stabilized=self.bpm_median_stab.update(smoothed); result.fused_bpm=stabilized; self._frozen_bpm=stabilized
 

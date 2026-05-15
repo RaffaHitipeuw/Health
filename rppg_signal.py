@@ -22,13 +22,21 @@ def apply_windowing(signal, window_type='hann'):
 
 def mature_harmonic_rejection(psd, freqs, peak_hz, threshold=0.15):
     """
-    Checks if peak_hz is likely a harmonic of a lower fundamental frequency.
-    If 144 BPM is strong but 72 BPM also exists, prefer 72 BPM.
+    Enhanced Harmonic Rejection:
+    1. Checks if peak_hz is a harmonic of a lower fundamental.
+    2. Aggressive sub-harmonic check for candidates > 130 BPM (Zombie 144 BPM fix).
+    3. Prefers sub-harmonic if it has >25% energy of the main peak.
     """
-    # 1. Check if peak_hz itself is a harmonic of a lower frequency
-    sub_harmonics = [peak_hz / 2.0, peak_hz / 3.0]
     main_mask = (freqs >= peak_hz - 0.1) & (freqs <= peak_hz + 0.1)
     main_peak = np.max(psd[main_mask]) if np.any(main_mask) else 1e-9
+    peak_bpm = peak_hz * 60.0
+
+    # 1. Sub-harmonic Validation (Fundamental check)
+    # If we are at 144 BPM, check 72 BPM (f/2) and 48 BPM (f/3)
+    sub_harmonics = [peak_hz / 2.0, peak_hz / 3.0]
+    
+    # Aggressive threshold for high BPMs (Zombie 144 BPM fix)
+    sub_energy_threshold = 0.25 if peak_bpm > 130 else 0.40
     
     for sub_h in sub_harmonics:
         if sub_h < 0.7: # Below 42 BPM
@@ -36,12 +44,11 @@ def mature_harmonic_rejection(psd, freqs, peak_hz, threshold=0.15):
         sub_mask = (freqs >= sub_h - 0.1) & (freqs <= sub_h + 0.1)
         if np.any(sub_mask):
             sub_peak = np.max(psd[sub_mask])
-            # If sub-harmonic has significant energy (even if lower than main peak),
-            # it's highly suspicious that the main peak is just a harmonic.
-            if sub_peak > 0.3 * main_peak:
+            # If sub-harmonic has significant energy, the higher peak is likely a harmonic
+            if sub_peak > sub_energy_threshold * main_peak:
                 return True
 
-    # 2. Check if higher harmonics are unusually strong (classic rPPG failure)
+    # 2. Higher Harmonic Check (Classic failure mode)
     harmonics = [2 * peak_hz, 3 * peak_hz]
     for h in harmonics:
         if h > freqs[-1]:

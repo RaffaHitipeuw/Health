@@ -162,40 +162,55 @@ class PosteriorSQI:
 
     def _regularity(self, peaks: np.ndarray, fps: float, signal: np.ndarray = None) -> float:
         """
-        Calculates signal regularity using both peak-to-peak interval consistency (CV)
-        and autocorrelation-based periodicity.
+        Overhauled Regularity Engine:
+        1. Bandpass Filtering (Physiological Range)
+        2. Z-score Normalization
+        3. Lag-limited Autocorrelation (42-180 BPM)
+        4. Smooth Scoring (No binary gating)
         """
         # 1. Peak-to-Peak Consistency (Time Domain)
         reg_peaks = 0.0
         if len(peaks) >= 3:
             ibi = np.diff(peaks) / fps
             cv  = float(np.std(ibi) / (np.mean(ibi) + 1e-9))
-            reg_peaks = float(np.clip(1.0 - cv, 0.0, 1.0))
+            # Smooth CV scoring: Humans are messy, allow some variance
+            reg_peaks = float(np.clip(1.2 - (cv / 0.25), 0.0, 1.0))
         elif len(peaks) == 2:
-            reg_peaks = 0.2
+            reg_peaks = 0.3
 
         # 2. Autocorrelation Periodicity (Waveform Consistency)
         reg_acf = 0.0
         if signal is not None and len(signal) >= 30:
-            from scipy.signal import correlate, find_peaks
-            n = len(signal)
-            # Normalize signal for ACF
-            sig_norm = (signal - np.mean(signal)) / (np.std(signal) + 1e-9)
+            from scipy.signal import correlate, butter, filtfilt
+            
+            # Bandpass BEFORE regularity: 0.7 Hz - 3.0 Hz (42 - 180 BPM)
+            try:
+                b, a = butter(4, [0.7 / (fps / 2), 3.0 / (fps / 2)], btype='band')
+                sig_clean = filtfilt(b, a, signal)
+            except:
+                sig_clean = signal
+            
+            # Z-score Normalize waveform
+            sig_norm = (sig_clean - np.mean(sig_clean)) / (np.std(sig_clean) + 1e-9)
+            
+            n = len(sig_norm)
             acf = correlate(sig_norm, sig_norm, mode='full')[n-1:]
             acf = acf / (acf[0] + 1e-12) # Normalize by zero-lag
             
-            # Find the second peak (first peak after zero-lag)
-            # Humans have HR between 42-200 BPM -> 0.3s to 1.4s lag
-            min_lag = int(fps * 0.3)
-            max_lag = int(fps * 1.5)
-            if len(acf) > min_lag:
-                acf_search = acf[min_lag:min_lag + max_lag]
+            # Find the second peak in physiological lag (42-180 BPM)
+            lag_min = int(fps * 60 / 180) # ~0.33s
+            lag_max = int(fps * 60 / 42)  # ~1.42s
+            
+            if len(acf) > lag_min:
+                # Limit search to physiological range
+                acf_search = acf[lag_min:min(len(acf), lag_max)]
                 if len(acf_search) > 0:
-                    reg_acf = float(np.max(acf_search))
+                    acf_peak = float(np.max(acf_search))
+                    # Smooth scoring: (acf_peak - 0.2) / 0.6
+                    reg_acf = float(np.clip((acf_peak - 0.2) / 0.6, 0.0, 1.0))
         
-        # Combined Regularity: Humans aren't metronomes, so we take a weighted max
-        # If either the peaks are consistent OR the waveform is periodic, it's valid.
-        combined_reg = 0.6 * reg_acf + 0.4 * reg_peaks
+        # Combined Regularity: Prioritize ACF for waveform shape, CV for timing
+        combined_reg = 0.7 * reg_acf + 0.3 * reg_peaks
         return float(np.clip(combined_reg, 0.0, 1.0))
 
     def reset(self):
