@@ -164,10 +164,28 @@ class BayesianHREstimator:
         ci_upper = mean_bpm + 1.96 * total_std
 
 
-        sqi_term   = sqi / 100.0
-        agree_term = roi_agreement
-        ci_term    = float(np.exp(-(ci_upper - ci_lower) / 30.0))
-        confidence = float(np.cbrt(sqi_term * agree_term * ci_term) * 100.0)
+        # BUG FIX: Session Confidence. 
+        # The previous logic (cbrt) was too optimistic or sensitive to stale values.
+        # We need a more robust confidence that reflects the "unhealthy" state when ROIs disagree.
+        
+        sqi_term   = np.clip(sqi / 100.0, 0.0, 1.0)
+        
+        # Tighter agreement term: if agreement is low, confidence should crash.
+        # Based on petunjuk: agreement 1.00 when ROIs differ is a bug.
+        # Here we ensure the agreement term in confidence is punishing.
+        agree_term = np.power(roi_agreement, 2.0) 
+        
+        # CI term: width of 20 BPM should be a major penalty.
+        ci_term    = float(np.exp(-(ci_upper - ci_lower) / 15.0))
+        
+        # Combined confidence: use product for stricter "AND" logic.
+        # All three must be good for high confidence.
+        confidence = float(sqi_term * agree_term * ci_term * 100.0)
+        
+        # BUG FIX: Session confidence stuck at 0.0%. 
+        # Ensure it can actually grow but decays fast if conditions are bad.
+        if len(self._bpm_history) < 30: # Minimum window for "real" confidence
+            confidence *= (len(self._bpm_history) / 30.0)
 
 
         return HeartRateEstimate(

@@ -18,9 +18,9 @@ class RPPGConfig:
     RESP_LOW: float = 0.10
     RESP_HIGH: float = 0.50
 
-    SQI_HARD_GATE: float = 25.0
-    SQI_DISPLAY_GATE: float = 35.0
-    BASELINE_SQI_THRESHOLD: float = 50.0
+    SQI_HARD_GATE: float = 20.0 # Lowered from 25
+    SQI_DISPLAY_GATE: float = 25.0 # Lowered from 35
+    BASELINE_SQI_THRESHOLD: float = 35.0 # Lowered from 50
     ARRHYTHMIA_SQI_GATE: float = 70.0
 
     AGREEMENT_SQI_PENALTY_BELOW: float = 0.50
@@ -108,15 +108,15 @@ class RPPGConfig:
     CLUSTER_DISTANCE_BPM: float = 8.0
     MIN_CLUSTER_WEIGHT: float = 0.20
 
-    CALIBRATION_SQI_FLOOR: float = 45.0
+    CALIBRATION_SQI_FLOOR: float = 30.0
 
     ROI_BRIGHTNESS_MIN: float = 45.0
     ROI_BRIGHTNESS_MAX: float = 205.0
 
-    SQI_WEIGHT_SNR:          float = 0.30
-    SQI_WEIGHT_REGULARITY:   float = 0.30
+    SQI_WEIGHT_SNR:          float = 0.15
+    SQI_WEIGHT_REGULARITY:   float = 0.25
     SQI_WEIGHT_TEMPORAL:     float = 0.20
-    SQI_WEIGHT_PEAK_CONSIST: float = 0.10
+    SQI_WEIGHT_PEAK_CONSIST: float = 0.30
     SQI_WEIGHT_MOTION:       float = 0.10
     SQI_WEIGHT_VARIANCE:     float = 0.00
     SQI_PENALTY_WEIGHT:      float = 0.40

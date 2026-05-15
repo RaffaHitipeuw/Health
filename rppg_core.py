@@ -756,7 +756,7 @@ def estimate_bpm_fft(signal, fps, roi_name: str = ""):
 
 def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
                 roi_brightness=-1.0, fft_validation=None, prev_sqi=-1.0,
-                roi_obj=None, exposure_drift=0.0):
+                roi_obj=None, exposure_drift=0.0, roi_name=""):
     breakdown={"snr":0.0,"regularity":0.0,"variance":0.0,"motion_penalty":0.0,
                "lighting_penalty":0.0,"fft_penalty":0.0,"overall":0.0,
                "temporal_stability": 0.0, "peak_consistency": 0.0}
@@ -767,7 +767,12 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
     # Applied BEFORE temporal smoothing (prev_sqi blending) so artifact SQI
     # cannot be sustained by historical momentum alone.
     physio_prior = 1.0
-    if peak_bpm > cfg.PHYSIO_PRIOR_HIGH_BPM_THRESH and motion_score < cfg.PHYSIO_PRIOR_MOTION_EXEMPT:
+    # ── Forehead High BPM Penalty (Petunjuk) ───────────────────────────────────
+    # Forehead often locks to harmonic frequencies (144 BPM) or monitor flicker.
+    # We apply a brutal penalty if forehead reports high BPM while isolated.
+    if roi_name == "forehead" and peak_bpm > 130:
+        physio_prior = 0.3
+    elif peak_bpm > cfg.PHYSIO_PRIOR_HIGH_BPM_THRESH and motion_score < cfg.PHYSIO_PRIOR_MOTION_EXEMPT:
         physio_prior = cfg.PHYSIO_PRIOR_HIGH_BPM_SQI_MULT   # 0.18 — near-kill
     elif peak_bpm > cfg.PHYSIO_PRIOR_ELEV_BPM_THRESH and motion_score < cfg.PHYSIO_PRIOR_MOTION_EXEMPT:
         physio_prior = cfg.PHYSIO_PRIOR_ELEV_BPM_SQI_MULT   # 0.55
@@ -1008,14 +1013,15 @@ def compute_dynamic_roi_weight(roi, base_weight, motion_score, exposure_drift=0.
     if not (cfg.BPM_PLAUSIBLE_LOW <= roi.bpm <= cfg.BPM_PLAUSIBLE_HIGH):
         dyn_weight_factor *= cfg.ROI_BRUTAL_PENALTY
     
-    # 3. Absolute Rejection (No Winner Policy): Fix Normalization Trap
-    # If SQI < 45% or regularity < 15%, the ROI is "goblok" - kill it before normalization.
-    if roi.sqi < 45.0 or roi.roi_regularity < 15.0:
-        dyn_weight_factor = 0.0
+    # 3. BUG FIX: Soft Weighting. JANGAN ZERO OUT WEIGHT.
+    # rPPG webcam realistic range: 25-40 = usable, 40-60 = good.
+    # Instead of killing it, we use soft weighting.
+    if roi.sqi < 25.0 or roi.roi_regularity < 10.0:
+        dyn_weight_factor *= 0.1 # Soft penalty instead of 0.0
     
-    # Kill weight if motion is in REJECT state
+    # Motion still needs some suppression but maybe not total kill if it's brief
     if motion_score > cfg.MOTION_ENTER_THRESHOLD:
-        dyn_weight_factor = 0.0
+        dyn_weight_factor *= 0.05
         
     weight = base_weight * dyn_weight_factor
 
@@ -1027,7 +1033,12 @@ def compute_dynamic_roi_weight(roi, base_weight, motion_score, exposure_drift=0.
     if motion_score > 3.5: weight *= 0.5
     if exposure_drift > cfg.EXPOSURE_DRIFT_FREEZE: weight *= 0.1
     elif exposure_drift > cfg.EXPOSURE_DRIFT_WARN: weight *= cfg.EXPOSURE_DRIFT_WEIGHT_MULT
-    return float(np.clip(weight, cfg.DYN_WEIGHT_MIN, cfg.DYN_WEIGHT_MAX))
+    
+    # BUG FIX: Normalization Trap. Ensure we have a MIN_WEIGHT fallback.
+    # If the system collapses (all weights 0), it becomes schizophrenia.
+    # We enforce a small minimum weight so fusion always has a baseline.
+    MIN_WEIGHT_FALLBACK = 0.05
+    return float(np.clip(weight, MIN_WEIGHT_FALLBACK, cfg.DYN_WEIGHT_MAX))
 
 
 def cross_roi_harmonic_check(rois_dict):
@@ -1090,6 +1101,16 @@ def cross_roi_harmonic_check(rois_dict):
                     roi_a.is_harmonic_suspect = False
 
     # ── Ref-ROI harmonic suspect tagging (extended ratio check) ───────────────
+    # BUG FIX: Harmonic Resolver. Explicitly check for 2:1 relationships between ROIs.
+    for name, roi in rois_dict.items():
+        if roi.bpm <= 0: continue
+        for other_name, other_roi in rois_dict.items():
+            if roi is other_roi or other_roi.bpm <= 0: continue
+            # If ROI A is ~2x ROI B, and ROI B has decent quality, A is likely a harmonic zombie
+            if abs(roi.bpm - other_roi.bpm * 2.0) < 8.0 and other_roi.sqi > 25.0:
+                roi.is_harmonic_suspect = True
+                roi.agreement_factor *= 0.25 # Penalize agreement immediately
+    
     ref_roi = max(rois_dict.values(), key=lambda r: r.sqi)
     ref_bpm = ref_roi.bpm; harmonic_ratios = [2.0, 3.0, 0.5, 0.333]; tol_ratio = 0.08
     for name, roi in rois_dict.items():
@@ -1286,7 +1307,7 @@ class MultiROIFusionEngine:
 
                     sqi_cal, sqi_meta = self.calibrated_sqi.calculate_sqi(sig_filt, fps, bpm_raw)
                     
-                    sqi_legacy, breakdown = compute_sqi(sig_filt,fps,bpm_raw,motion_score=motion_score,mean_brightness=result.frame_brightness,roi_brightness=roi.roi_brightness,fft_validation=fft_val,prev_sqi=roi.sqi,roi_obj=roi,exposure_drift=result.exposure_drift)
+                    sqi_legacy, breakdown = compute_sqi(sig_filt,fps,bpm_raw,motion_score=motion_score,mean_brightness=result.frame_brightness,roi_brightness=roi.roi_brightness,fft_validation=fft_val,prev_sqi=roi.sqi,roi_obj=roi,exposure_drift=result.exposure_drift,roi_name=roi_name)
                     
 
 
@@ -1373,8 +1394,18 @@ class MultiROIFusionEngine:
         if not candidates: candidates = {ref_roi.name: ref_roi}
 
 
-        all_valid_bpms = [r.bpm for r in valid_rois.values() if r.bpm > 0]
-        median_bpm = float(np.median(all_valid_bpms)) if all_valid_bpms else 0.0
+        # BUG FIX: Median BPM. Use SQI-weighted median if possible to avoid 144 BPM pulling the median.
+        all_valid_items = [(r.bpm, r.sqi) for r in valid_rois.values() if r.bpm > 0]
+        if not all_valid_items:
+            median_bpm = 0.0
+        else:
+            # Sort by BPM and find weighted median
+            all_valid_items.sort(key=lambda x: x[0])
+            bpms = [x[0] for x in all_valid_items]
+            weights = [max(0.1, x[1]) for x in all_valid_items]
+            cum_weights = np.cumsum(weights)
+            cutoff = cum_weights[-1] / 2.0
+            median_bpm = bpms[np.searchsorted(cum_weights, cutoff)]
         
         # 2. Cross-ROI Coherence Validation: Pulse is a global vascular rhythm.
         # If ROIs are on "different planets", it's likely noise (which rarely syncs).
@@ -1388,7 +1419,16 @@ class MultiROIFusionEngine:
         for roi in candidates.values():
             # Distance from median of ALL ROIs, not just candidates
             dev = abs(roi.bpm - median_bpm)
-            raw_agreement = float(np.exp(-dev / cfg.AGREEMENT_DEV_K))
+            
+            # ── BUG FIX: Agreement Engine (Petunjuk) ───────────────────────────────
+            # Formula lama: raw_agreement = 1 - abs(a-b)/MAX_BPM -> Sering ketipu.
+            # Formula baru: Exponential penalty (np.exp(-diff / 12)).
+            # diff 5 -> 0.65, diff 20 -> 0.18, diff 60 -> 0.006
+            raw_agreement = float(np.exp(-dev / 12.0))
+            
+            # Additional penalty for extreme outliers
+            if dev > 30.0:
+                raw_agreement *= 0.1 # Nuclear drop for dev > 30 BPM
             
             # SQI & Regularity weights: if reg is low, this ROI is noise
             sqi_factor = np.clip(roi.sqi / 100.0, 0.05, 1.0)
@@ -1401,13 +1441,15 @@ class MultiROIFusionEngine:
 
             physio_factor = 1.0
             if not (cfg.BPM_PLAUSIBLE_LOW <= roi.bpm <= cfg.BPM_PLAUSIBLE_HIGH):
-                physio_factor = 0.1 # More aggressive penalty for 144 BPM
+                # BUG FIX: More aggressive penalty for biologically implausible BPMs (e.g. 144 BPM)
+                physio_factor = 0.05 
             
-            roi.agreement_factor = raw_agreement * sqi_factor * reg_factor * physio_factor * global_consensus_penalty
+            # BUG FIX: Ensure agreement_factor correctly reflects current frame state
+            roi.agreement_factor = float(np.clip(raw_agreement * sqi_factor * reg_factor * physio_factor * global_consensus_penalty, 0.0, 1.0))
             
             if dev > cfg.ROI_CONSENSUS_THRESHOLD:
                 roi.dynamic_weight *= cfg.ROI_BRUTAL_PENALTY
-                roi.agreement_factor *= 0.05
+                roi.agreement_factor *= 0.01 # Nuclear drop for disagreement
         
         accepted = {k: v for k, v in candidates.items() if v.agreement_factor >= cfg.ROI_MIN_AGREEMENT_FACTOR}
         if not accepted:
@@ -1465,7 +1507,16 @@ class MultiROIFusionEngine:
         
 
         fused_bpm_hier = hierarchical_fusion(roi_items_final)
-        fused_bpm_raw = 0.7 * fused_bpm_prob + 0.3 * fused_bpm_hier
+        
+        # BUG FIX: Architecture. ProbabilisticFusion ignores weights and has long memory.
+        # If weights are low, hierarchical_fusion is safer. 
+        # We also check if ProbabilisticFusion is diverging too much from the best ROIs.
+        best_roi_bpm = roi_items_final[0][1].bpm if roi_items_final else 0.0
+        if abs(fused_bpm_prob - best_roi_bpm) > 20.0 and best_roi_bpm > 0:
+             # Probabilistic fusion is stuck in the past/memory, trust hierarchical more
+             fused_bpm_raw = 0.2 * fused_bpm_prob + 0.8 * fused_bpm_hier
+        else:
+             fused_bpm_raw = 0.5 * fused_bpm_prob + 0.5 * fused_bpm_hier
         
 
         roi_sqis = {n: r.sqi for n, r, _ in roi_items_final}
@@ -1509,6 +1560,12 @@ class MultiROIFusionEngine:
                 # Temporal Fusion Memory (Inertia)
                 # Humans don't teleport. 0.8 * prev + 0.2 * current
                 fused_bpm_raw_inertia = 0.8 * prev_fused + 0.2 * fused_bpm_raw
+                
+                # BUG FIX: Inertia / Sudden Jump. 
+                # If abs(curr - prev) > 25, it's likely a harmonic jump or noise.
+                if abs(fused_bpm_raw - prev_fused) > 25.0:
+                    trust_penalty *= 0.3
+                    temporal_penalty *= 0.5 # Also penalize SQI
                 
                 # Combine inertia with rate-of-change trust
                 fused_bpm_raw_anchored = fused_bpm_raw_inertia * trust_penalty + prev_fused * (1.0 - trust_penalty)

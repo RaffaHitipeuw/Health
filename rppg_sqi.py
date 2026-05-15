@@ -274,7 +274,11 @@ class BayesianROIWeighting:
                 continue
                 
 
-            bpm_agreement = float(np.exp(-abs(bpm - fused_bpm) / 5.0))
+            # ── BUG FIX: Agreement Engine (Petunjuk) ───────────────────────────────
+            # Formula lama: exp(-diff / 5) -> Masih terlalu permisif.
+            # Formula baru: Exponential penalty (np.exp(-diff / 12)).
+            # Petunjuk menyarankan np.exp(-diff / 12) untuk agreement brutal.
+            bpm_agreement = float(np.exp(-abs(bpm - fused_bpm) / 12.0))
             
 
 
@@ -283,8 +287,10 @@ class BayesianROIWeighting:
                 if sqi < 80:
                     physio_validity *= 0.5
                 if name == "forehead":
-                    physio_validity *= 0.2 
-
+                    # ── Forehead High BPM Penalty (Petunjuk) ───────────────────────────
+                    # Forehead at high BPM is often a zombie lock (harmonic).
+                    # Petunjuk: sqi *= 0.3 atau sqi *= 0.2
+                    physio_validity *= 0.15 # Even more brutal for Bayesian update
             
 
             p_success  = (sqi / 100.0) * bpm_agreement * physio_validity
