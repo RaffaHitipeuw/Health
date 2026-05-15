@@ -1033,6 +1033,16 @@ def compute_dynamic_roi_weight(roi, base_weight, motion_score, exposure_drift=0.
     if roi.bpm > 115:
         dyn_weight_factor *= 0.35
 
+    # ── Hard SQI Reject (Petunjuk) ─────────────────────────────────────────────
+    # If SQI is too low, reject the ROI completely.
+    if roi.sqi < 10.0:
+        return 0.0 # Hard reject
+
+    # ── Brutal Low SQI Penalty (Petunjuk) ──────────────────────────────────────
+    # If SQI is low, apply a brutal penalty.
+    if roi.sqi < 15.0:
+        dyn_weight_factor *= 0.05
+
     # 3. BUG FIX: Soft Weighting. JANGAN ZERO OUT WEIGHT.
     # rPPG webcam realistic range: 25-40 = usable, 40-60 = good.
     # Instead of killing it, we use soft weighting.

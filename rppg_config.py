@@ -26,7 +26,7 @@ class RPPGConfig:
     AGREEMENT_SQI_PENALTY_BELOW: float = 0.50
     AGREEMENT_SQI_PENALTY_COEFF: float = 0.50
 
-    DYN_WEIGHT_MIN: float = 0.3
+    DYN_WEIGHT_MIN: float = 0.01 # Allow weights to go to zero
     DYN_WEIGHT_MAX: float = 3.0
     DYN_WEIGHT_NORM_MAX: float = 0.75
 
