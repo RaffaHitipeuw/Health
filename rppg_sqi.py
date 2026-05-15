@@ -107,10 +107,21 @@ class PosteriorSQI:
 
         log_bio = 0.0
         # Petunjuk: HARD REJECT BPM > 130
-        if peak_bpm > 130:
+        # Petunjuk: JANGAN kasih 140+ lolos kecuali confidence brutal.
+        if peak_bpm > 135:
+            log_bio = -15.0 # Total Reject
+        elif peak_bpm > 130:
             log_bio = -10.0 # Extreme penalty (effective kill)
         elif peak_bpm > 115 and motion_score < 1.0:
             log_bio = -5.0   # Strong prior against resting tachycardia
+
+        # Petunjuk: Harmonic/Subharmonic relation penalty
+        if hasattr(self, '_last_stable_fused_bpm') and self._last_stable_fused_bpm > 0:
+            ratio = peak_bpm / self._last_stable_fused_bpm
+            if 1.8 < ratio < 2.2:
+                log_bio -= 4.0 # Heavy harmonic penalty
+            elif 0.45 < ratio < 0.55:
+                log_bio -= 4.0 # Heavy subharmonic penalty
 
 
         if self.roi_name == "forehead" and peak_bpm > 125:
@@ -124,9 +135,13 @@ class PosteriorSQI:
         if len(psd) > 0:
             sorted_psd = np.sort(psd[noise_mask])
             if len(sorted_psd) > 2:
+                # ── Peak Ratio Filter (Petunjuk) ──────────────────────────────────
+                # Peak utama harus significantly lebih tinggi dari peak kedua.
                 peak_ratio = p_signal / (np.sum(sorted_psd[-3:]) + 1e-9)
-                if peak_ratio < 1.5:
-                    log_peak = -1.0
+                if peak_ratio < 1.3:
+                    log_peak = -5.0 # Reject fake peaks
+                elif peak_ratio < 1.8:
+                    log_peak = -1.5 # Weak peak dominance penalty
 
         # Petunjuk: TAMBAH TEMPORAL INERTIA
         log_temporal = 0.0
@@ -291,13 +306,21 @@ class BayesianROIWeighting:
             # Petunjuk menyarankan np.exp(-diff / 12) untuk agreement brutal.
             bpm_agreement = float(np.exp(-abs(bpm - fused_bpm) / 12.0))
             
-            # ── Subharmonic / Half-Frequency Lock (Petunjuk) ───────────────────────
-            # If ROI BPM is ~0.5x of fused BPM, it's a subharmonic artifact.
-            # Petunjuk: 0.45 < bpm / stable < 0.55 -> penalty *= 0.4
+            # ── Harmonic / Subharmonic Relation (Petunjuk) ───────────────────────
+            # If ROI BPM is ~0.5x or ~2x of fused BPM, it's an artifact.
+            # Petunjuk: 0.45 < ratio < 0.55 or 1.8 < ratio < 2.2
             if fused_bpm > 0:
                 ratio = bpm / fused_bpm
                 if 0.45 < ratio < 0.55:
                     bpm_agreement *= 0.4
+                elif 1.8 < ratio < 2.2:
+                    bpm_agreement *= 0.3 # Even heavier for harmonic zombie lock
+            
+            # ── Strict BPM Gating (Petunjuk) ──────────────────────────────────────
+            if bpm > 135:
+                bpm_agreement *= 0.05
+            elif bpm > 130:
+                bpm_agreement *= 0.20
             
 
 
@@ -346,6 +369,11 @@ class StatisticallyCalibratedSQI:
                       motion_score=0.0, exposure_drift=0.0, prev_sqi=-1.0):
         if roi_name not in self._calcs:
             self._calcs[roi_name] = PosteriorSQI(roi_name)
+        
+        # Pass stable BPM anchor for harmonic/subharmonic rejection
+        if hasattr(self, '_last_stable_fused_bpm'):
+            self._calcs[roi_name]._last_stable_fused_bpm = self._last_stable_fused_bpm
+            
         r = self._calcs[roi_name].compute(
             signal, fps, peak_bpm, motion_score, exposure_drift, prev_sqi)
         meta = {

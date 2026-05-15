@@ -150,6 +150,9 @@ class RPPGConfig:
     SUBHARMONIC_RATIO_LOW: float = 0.45
     SUBHARMONIC_RATIO_HIGH: float = 0.55
     SUBHARMONIC_PENALTY: float = 0.4
+    HARMONIC_RATIO_LOW: float = 1.8
+    HARMONIC_RATIO_HIGH: float = 2.2
+    HARMONIC_PENALTY: float = 0.3
 
     # ── Harmonic Zombie System ─────────────────────────────────────────────────
     # Consecutive frames at 2:1 ratio before full zombie lock

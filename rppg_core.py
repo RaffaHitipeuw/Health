@@ -50,11 +50,9 @@ CHEEK_LEFT_LANDMARKS = [
 CHEEK_RIGHT_LANDMARKS = [
     280, 330, 347, 346, 345, 352, 376, 411, 427, 426, 425, 266, 371, 355, 329, 423]
 ROI_CONFIGS = {
-    "forehead":    {"landmarks": FOREHEAD_LANDMARKS,    "base_weight": 0.7},
-    "cheek_left":  {"landmarks": CHEEK_LEFT_LANDMARKS,  "base_weight": 0.3},
-    "cheek_right": {"landmarks": CHEEK_RIGHT_LANDMARKS, "base_weight": 0.3},
-
-
+    "forehead":    {"landmarks": FOREHEAD_LANDMARKS,    "base_weight": 0.15},
+    "cheek_left":  {"landmarks": CHEEK_LEFT_LANDMARKS,  "base_weight": 0.25},
+    "cheek_right": {"landmarks": CHEEK_RIGHT_LANDMARKS, "base_weight": 0.60},
 }
 
 
@@ -767,11 +765,13 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
     # Applied BEFORE temporal smoothing (prev_sqi blending) so artifact SQI
     # cannot be sustained by historical momentum alone.
     physio_prior = 1.0
-    # ── Forehead High BPM Penalty (Petunjuk) ───────────────────────────────────
-    # Forehead often locks to harmonic frequencies (144 BPM) or monitor flicker.
-    # Petunjuk: if bpm > 130: sqi *= 0.2
-    if peak_bpm > 130:
-        physio_prior = 0.2
+    # ── Strict BPM Gating (Petunjuk) ───────────────────────────────────
+    # Petunjuk: JANGAN kasih 140+ lolos kecuali confidence brutal.
+    # if bpm > 130: sqi *= 0.25. if bpm > 135: reject.
+    if peak_bpm > 135:
+        physio_prior = 0.0  # REJECT total
+    elif peak_bpm > 130:
+        physio_prior = 0.25 # Severe penalty
     elif roi_name == "forehead" and peak_bpm > 115:
         physio_prior = 0.4
     elif peak_bpm > cfg.PHYSIO_PRIOR_HIGH_BPM_THRESH and motion_score < cfg.PHYSIO_PRIOR_MOTION_EXEMPT:
@@ -805,18 +805,26 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
         last_bpm = list(roi_obj._bpm_history)[-1]
         if abs(peak_bpm - last_bpm) > 25:
             temporal_inertia_mult = 0.4
+            # Petunjuk: if abs(candidate_bpm - stable_bpm) > 25 and harmonic relation -> heavy penalty
+            stable_fused = getattr(roi_obj, '_last_stable_fused_bpm', 0.0)
+            if stable_fused > 0:
+                ratio = peak_bpm / stable_fused
+                if (cfg.HARMONIC_RATIO_LOW < ratio < cfg.HARMONIC_RATIO_HIGH) or \
+                   (cfg.SUBHARMONIC_RATIO_LOW < ratio < cfg.SUBHARMONIC_RATIO_HIGH):
+                    temporal_inertia_mult = 0.2 # Even heavier penalty for harmonic jumps
 
-    # ── Subharmonic / Half-Frequency Lock (Petunjuk) ──────────────────────────
-    # If this ROI's BPM is ~0.5x of a stable fused BPM, it's likely a subharmonic lock.
-    subharmonic_mult = 1.0
-    # We use a persistent stable BPM from the smoother if available
+    # ── Harmonic / Subharmonic Relation (Petunjuk) ──────────────────────────
+    # If this ROI's BPM is ~0.5x or ~2x of a stable fused BPM, it's likely a lock.
+    harmonic_relation_mult = 1.0
     stable_bpm = getattr(roi_obj, '_last_stable_fused_bpm', 0.0)
     if stable_bpm > 0:
         ratio = peak_bpm / stable_bpm
         if cfg.SUBHARMONIC_RATIO_LOW < ratio < cfg.SUBHARMONIC_RATIO_HIGH:
-            subharmonic_mult = cfg.SUBHARMONIC_PENALTY
+            harmonic_relation_mult = cfg.SUBHARMONIC_PENALTY
+        elif cfg.HARMONIC_RATIO_LOW < ratio < cfg.HARMONIC_RATIO_HIGH:
+            harmonic_relation_mult = cfg.HARMONIC_PENALTY
 
-    bio_penalty = physio_prior * sine_purity_mult * temporal_inertia_mult * subharmonic_mult
+    bio_penalty = physio_prior * sine_purity_mult * temporal_inertia_mult * harmonic_relation_mult
 
     sig=signal-np.mean(signal); sig=scipy_detrend(sig,type="linear")
     n=len(sig); fft_v=np.abs(np.fft.rfft(sig*np.hanning(n)))**2
@@ -876,10 +884,16 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
             p1_power = top3[0][1]
             p2_power = top3[1][1]
             peak_ratio = p1_power / (p2_power + 1e-9)
-            if peak_ratio < cfg.PEAK_DOMINANCE_RATIO_MIN:
-
-                if "fft_penalty" not in locals(): fft_penalty = 0.0
-                fft_penalty += 0.2
+            
+            # ── Peak Ratio Filter (Petunjuk) ──────────────────────────────────
+            # Peak utama harus significantly lebih tinggi dari peak kedua.
+            # Petunjuk: if peak_ratio < 1.3: reject
+            if peak_ratio < 1.3:
+                # Heavy penalty to kill fake peaks
+                fft_penalty = getattr(locals(), 'fft_penalty', 0.0) + 0.6
+                bio_penalty *= 0.2
+            elif peak_ratio < cfg.PEAK_DOMINANCE_RATIO_MIN:
+                fft_penalty = getattr(locals(), 'fft_penalty', 0.0) + 0.2
 
 
     fft_penalty=0.0
@@ -901,8 +915,11 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
     
     current_inst_stability = 1.0
     if roi_obj is not None and len(roi_obj._bpm_history) >= 5:
-        hist = list(roi_obj._bpm_history); bpm_std = np.std(hist); bpm_mean = np.mean(hist)
-        current_inst_stability = max(0.0, 1.0 - (bpm_std / (bpm_mean + 1e-9)) * 5.0)
+        # ── Stability Recovery (Petunjuk) ──────────────────────────────────
+        # Relaxed from 5.0 to 3.0 multiplier to prevent stability from collapsing to 0%
+        # during normal physiological heart rate variability.
+        hist = list(roi_obj._bpm_history)[-10:]; bpm_std = np.std(hist); bpm_mean = np.mean(hist)
+        current_inst_stability = max(0.0, 1.0 - (bpm_std / (bpm_mean + 1e-9)) * 3.0)
     
 
     temp_stability = prev_stability * 0.9 + current_inst_stability * 0.1
@@ -967,6 +984,15 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
             consensus_pen = (0.7 - af) / 0.7 * 0.30
             raw *= (1.0 - consensus_pen)
             
+    # ── Temporal Stability Check (Petunjuk) ───────────────────────────────────
+    # Petunjuk: stab=0% peak=98% -> REJECT.
+    # If peak is high but stability is zero, it's a spectral spike artifact.
+    # current_inst_stability is already calculated above.
+    if current_inst_stability < 0.10 and peak_consistency > 0.85:
+        # Nuclear nuke for suspicious isolated spectral spikes
+        bio_penalty *= 0.05 # Even more brutal
+        if roi_obj: roi_obj.agreement_factor *= 0.1
+
     overall=raw*100.0 * bio_penalty
     # NOTE: bio_penalty (physiological prior × sinusoidal purity) is applied BEFORE
     # temporal smoothing.  This prevents artifact SQI from being sustained by prev_sqi
@@ -1563,8 +1589,9 @@ class MultiROIFusionEngine:
         roi_bpms = {n: r.bpm for n, r, _ in roi_items_final}
         
         # Pass fused_bpm to ROIs for subharmonic detection in next frame
-        for n, r, _ in roi_items_final:
-            if fused_bpm_raw > 0:
+        if fused_bpm_raw > 0:
+            self.calibrated_sqi._last_stable_fused_bpm = fused_bpm_raw
+            for n, r, _ in roi_items_final:
                 r._last_stable_fused_bpm = fused_bpm_raw
 
         self.learned_weighting.update_weights(roi_sqis, fused_bpm_raw, roi_bpms)
@@ -1609,9 +1636,10 @@ class MultiROIFusionEngine:
                 
                 # BUG FIX: Inertia / Sudden Jump. 
                 # If abs(curr - prev) > 25, it's likely a harmonic jump or noise.
+                temporal_penalty = 1.0
                 if abs(fused_bpm_raw - prev_fused) > 25.0:
                     trust_penalty *= 0.3
-                    temporal_penalty *= 0.5 # Also penalize SQI
+                    temporal_penalty = 0.5 # Also penalize SQI
                 
                 # Combine inertia with rate-of-change trust
                 fused_bpm_raw_anchored = fused_bpm_raw_inertia * trust_penalty + prev_fused * (1.0 - trust_penalty)
