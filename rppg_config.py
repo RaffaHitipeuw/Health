@@ -54,8 +54,8 @@ class RPPGConfig:
     SESSION_CONF_CONSISTENCY_WINDOW: int = 180
     SESSION_CONF_AGREEMENT_FLOOR: float = 0.4
 
-    EXPOSURE_DRIFT_WARN: float = 8.0
-    EXPOSURE_DRIFT_FREEZE: float = 20.0
+    EXPOSURE_DRIFT_WARN: float = 20.0
+    EXPOSURE_DRIFT_FREEZE: float = 40.0
     EXPOSURE_DRIFT_SQI_PENALTY: float = 0.35
     EXPOSURE_DRIFT_WEIGHT_MULT: float = 0.45
 
@@ -110,7 +110,7 @@ class RPPGConfig:
 
     CALIBRATION_SQI_FLOOR: float = 30.0
 
-    ROI_BRIGHTNESS_MIN: float = 45.0
+    ROI_BRIGHTNESS_MIN: float = 60.0
     ROI_BRIGHTNESS_MAX: float = 205.0
 
     SQI_WEIGHT_SNR:          float = 0.25

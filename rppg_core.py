@@ -936,21 +936,20 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
 
 
     # Hard Propagation of Detector State
-    # Sync with Motion Detector REJECT state
+    # Sync with Motion Detector REJECT state (Petunjuk: JANGAN langsung nuklir)
     motion_penalty = 0.0
     if motion_score > cfg.MOTION_EXIT_THRESHOLD:
-        motion_penalty = min((motion_score - cfg.MOTION_EXIT_THRESHOLD) / 4.0, cfg.SQI_MAX_MOTION_PENALTY)
+        # Relaxed penalty: Jangan langsung 1.0. Gunakan min(0.5, motion_score) atau serupa.
+        motion_penalty = min(motion_score / 15.0, cfg.SQI_MAX_MOTION_PENALTY)
         
-        # If motion detector says REJECT, motion_penalty MUST NOT be zero.
-        # Hard rejection: if detector says REJECT, force penalty to 1.0
+        # If motion detector says REJECT, we still keep it graceful
         if motion_score > cfg.MOTION_ENTER_THRESHOLD:
-            motion_penalty = 1.0 # Brutal penalty for REJECT state
+            motion_penalty = min(0.5, motion_penalty + 0.2) # Max 0.5 penalty for REJECT state
         else:
-            # Even if not REJECT, ensure a minimum penalty if above exit threshold
-            motion_penalty = max(motion_penalty, 0.3)
+            motion_penalty = max(motion_penalty, 0.1)
 
-        if hasattr(roi_obj, 'motion_penalty'):
-            motion_penalty = min(1.0, motion_penalty + roi_obj.motion_penalty)
+    if roi_obj is not None and hasattr(roi_obj, 'motion_penalty'):
+        motion_penalty = min(1.0, motion_penalty + roi_obj.motion_penalty)
 
     bref=roi_brightness if roi_brightness>=0 else mean_brightness
     lighting_penalty=0.0
@@ -958,9 +957,9 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
     elif bref>210: lighting_penalty=min((bref-210)/40.0, cfg.SQI_MAX_LIGHTING_PENALTY)
     if exposure_drift > cfg.EXPOSURE_DRIFT_WARN:
         drift_ratio = min((exposure_drift - cfg.EXPOSURE_DRIFT_WARN) / (cfg.EXPOSURE_DRIFT_FREEZE - cfg.EXPOSURE_DRIFT_WARN), 1.0)
-        # If drift is near freeze threshold, force heavy penalty
-        if exposure_drift > cfg.EXPOSURE_DRIFT_FREEZE * 0.8:
-            lighting_penalty = 0.9
+        # If drift is near freeze threshold, force heavy penalty (Petunjuk: JANGAN 0.9 langsung)
+        if exposure_drift > cfg.EXPOSURE_DRIFT_FREEZE * 0.9:
+            lighting_penalty = 0.6 # Relaxed from 0.9
         else:
             drift_sqi_pen = drift_ratio * cfg.EXPOSURE_DRIFT_SQI_PENALTY
             lighting_penalty = min(lighting_penalty + drift_sqi_pen, cfg.SQI_MAX_LIGHTING_PENALTY)
@@ -1330,16 +1329,23 @@ class MultiROIFusionEngine:
                 
             valid_rois[k]=v
         
-        # Motion Rejection: Hard reject if motion is too high
+        # Motion Rejection: Soft penalty instead of hard reject (Petunjuk)
         if is_moving:
             result.motion_rejected = True
-            result.output_frozen = True
-            # Zero out weights during motion to prevent "normalization trap"
+            # JANGAN langsung nuklir SQI jadi 0. Bikin graceful degradation.
+            # motion_penalty = min(0.5, motion_score)
+            # sqi *= (1.0 - motion_penalty)
+            motion_penalty_factor = max(0.4, 1.0 - min(0.5, motion_score / 10.0))
             for r in self.rois.values():
-                r.dynamic_weight = 0.0
-                r.sqi = 0.0
+                r.sqi *= motion_penalty_factor
+                r.dynamic_weight *= motion_penalty_factor
+            
+            # Keep metrics alive (JANGAN overwrite seluruh metric breakdown saat reject)
+            # meta["motion_rejected"] = True ditangani oleh result.motion_rejected
+            
             if not valid_rois:
                 result.roi_signals = {k: v for k, v in self.rois.items()}
+                # Masih return jika benar-benar tidak ada ROI valid, tapi biarkan metrics tetap ada
                 return result
 
         if not valid_rois: result.roi_signals={k:v for k,v in self.rois.items()}; return result

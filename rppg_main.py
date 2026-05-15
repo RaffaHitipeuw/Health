@@ -233,7 +233,7 @@ def draw_guidance(frame, tips: list, guidance_msg: Optional[str],
         y += 18
 
 
-    if exposure_drift > 15:
+    if exposure_drift > 35:
         put_text(frame, f"[EXPO] Camera auto-exposure drift: {exposure_drift:.1f} — normalizing",
                  10, y, 0.42, PALETTE["teal"])
         y += 18
@@ -401,7 +401,7 @@ def main():
 
         if fr.motion_rejected:
             vitals_engine.failure_log.log("motion_rejected", f"score={fr.motion_score:.2f}", fr.motion_score)
-        if fr.exposure_drift > 15:
+        if fr.exposure_drift > 35:
             vitals_engine.failure_log.log("exposure_drift", f"drift={fr.exposure_drift:.1f}", fr.exposure_drift)
 
         mean_brightness = fr.frame_brightness
