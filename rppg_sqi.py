@@ -106,14 +106,13 @@ class PosteriorSQI:
 
 
         log_bio = 0.0
-        if peak_bpm > 135 and motion_score < 1.0:
-            log_bio = -3.0
+        if peak_bpm > 130 and motion_score < 1.0:
+            log_bio = -5.0   # Was -3.0 — much stronger prior against resting tachycardia
 
 
-        if self.roi_name == "forehead" and peak_bpm > 130:
-
-
-            log_bio -= 4.0 
+        if self.roi_name == "forehead" and peak_bpm > 125:
+            # Forehead at high BPM is textbook harmonic zombie territory
+            log_bio -= 5.0   # Was -4.0 — nuclear double penalty
 
             
 
@@ -136,9 +135,13 @@ class PosteriorSQI:
 
         p_valid = float(1.0 / (1.0 + np.exp(-log_post)))
         if prev_sqi >= 0:
-
-
-            p_valid = 0.35 * p_valid + 0.65 * (prev_sqi / 100.0)
+            # Only blend with history when the current estimate is not severely penalized.
+            # If log_bio is very negative (harmonic/BPM prior fired hard), bypass blending
+            # so the zombie can't maintain SQI through historical momentum.
+            if log_bio < -4.0:
+                pass   # No blending — hard penalty lands immediately
+            else:
+                p_valid = 0.35 * p_valid + 0.65 * (prev_sqi / 100.0)
 
         sqi = float(np.clip(p_valid * 100.0, 0.0, 100.0))
         self._sqi_history.append(sqi)

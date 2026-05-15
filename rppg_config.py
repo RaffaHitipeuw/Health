@@ -146,6 +146,30 @@ class RPPGConfig:
     PEAK_PERSISTENCE_LIMIT: int = 150 # Frames before we suspect peak locking
     PEAK_PERSISTENCE_BPM_TOL: float = 1.0
 
+    # ── Harmonic Zombie System ─────────────────────────────────────────────────
+    # Consecutive frames at 2:1 ratio before full zombie lock
+    ZOMBIE_LOCK_FRAMES: int = 5
+    # Weight returned for confirmed zombie (bypasses DYN_WEIGHT_MIN clip)
+    ZOMBIE_WEIGHT: float = 0.0
+    # SQI multiplier for suspected zombie (streak 1-4)
+    ZOMBIE_SQI_RAMP: float = 0.25   # per streak-frame penalty factor base
+    # SQI multiplier for confirmed zombie (streak >= ZOMBIE_LOCK_FRAMES)
+    ZOMBIE_SQI_NUKE: float = 0.08
+
+    # ── Physiological BPM Prior ────────────────────────────────────────────────
+    # Applied to SQI BEFORE temporal smoothing so it can't be buried by history
+    PHYSIO_PRIOR_HIGH_BPM_THRESH: float = 130.0   # > this = suspicious
+    PHYSIO_PRIOR_HIGH_BPM_SQI_MULT: float = 0.18  # multiplier: nearly impossible resting
+    PHYSIO_PRIOR_ELEV_BPM_THRESH: float = 115.0   # > this = elevated without motion
+    PHYSIO_PRIOR_ELEV_BPM_SQI_MULT: float = 0.55  # multiplier: possible but penalized
+    PHYSIO_PRIOR_MOTION_EXEMPT: float = 1.8        # motion_score above this exempts prior
+
+    # ── Sinusoidal Purity Penalty ──────────────────────────────────────────────
+    # Real PPG is asymmetric; a too-clean sine is likely artifact
+    SINE_PURITY_THRESHOLD: float = 0.93     # |corr| above this triggers penalty
+    SINE_PURITY_BPM_MIN: float = 110.0      # Only penalize at elevated BPMs
+    SINE_PURITY_SQI_MULT: float = 0.55      # SQI multiplier for sine-pure signals
+
     KALMAN_Q_BPM: float = 0.5
     KALMAN_Q_VEL: float = 0.005
     KALMAN_R_BPM: float = 20.0

@@ -90,6 +90,8 @@ class ROISignal:
     _peak_persistence_count: int = 0
     _last_stable_peak: float = 0.0
     is_harmonic_suspect: bool = False
+    # Consecutive frames this ROI has been flagged as a 2:1 harmonic zombie
+    _harmonic_zombie_streak: int = 0
 
     _bad_streak: int = 0
     _excluded_until: int = 0
@@ -101,6 +103,7 @@ class ROISignal:
         self.roi_snr = 0.0; self.roi_regularity = 0.0
         self.dynamic_weight = 1.0; self.skin_coverage = 1.0
         self.agreement_factor = 1.0; self.is_harmonic_suspect = False
+        self._harmonic_zombie_streak = 0
         self._reg_history.clear(); self._var_history.clear()
         self._bpm_history.clear(); self._bad_streak = 0; self._excluded_until = 0
         self._peak_persistence_count = 0; self._last_stable_peak = 0.0
@@ -760,15 +763,35 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
     if len(signal)<30 or peak_bpm<=0: return 0.0, breakdown
 
 
-    bio_penalty = 1.0
-    if peak_bpm > 140 and motion_score < 1.0:
-        bio_penalty = 0.5
-    
+    # ── Physiological BPM Prior ────────────────────────────────────────────────
+    # Applied BEFORE temporal smoothing (prev_sqi blending) so artifact SQI
+    # cannot be sustained by historical momentum alone.
+    physio_prior = 1.0
+    if peak_bpm > cfg.PHYSIO_PRIOR_HIGH_BPM_THRESH and motion_score < cfg.PHYSIO_PRIOR_MOTION_EXEMPT:
+        physio_prior = cfg.PHYSIO_PRIOR_HIGH_BPM_SQI_MULT   # 0.18 — near-kill
+    elif peak_bpm > cfg.PHYSIO_PRIOR_ELEV_BPM_THRESH and motion_score < cfg.PHYSIO_PRIOR_MOTION_EXEMPT:
+        physio_prior = cfg.PHYSIO_PRIOR_ELEV_BPM_SQI_MULT   # 0.55
 
+    # Unstable BPM history still gets a penalty (kept from original logic)
     if roi_obj is not None and hasattr(roi_obj, '_bpm_history') and len(roi_obj._bpm_history) >= 5:
         bpm_std = np.std(list(roi_obj._bpm_history))
         if bpm_std > 15.0:
-            bio_penalty *= 0.5
+            physio_prior *= 0.7
+
+    # ── Sinusoidal Purity Penalty ──────────────────────────────────────────────
+    # Real PPG has systolic/diastolic asymmetry; a near-perfect sine at elevated
+    # frequency is a hallmark of lighting oscillation or rolling-shutter artifact.
+    sine_purity_mult = 1.0
+    if peak_bpm >= cfg.SINE_PURITY_BPM_MIN:
+        _peak_hz_sp = peak_bpm / 60.0
+        _t_sp = np.arange(len(signal)) / fps
+        _ideal_sine = np.sin(2.0 * np.pi * _peak_hz_sp * _t_sp)
+        _sig_z = (signal - np.mean(signal)) / (np.std(signal) + 1e-9)
+        _corr = float(np.corrcoef(_sig_z, _ideal_sine)[0, 1])
+        if abs(_corr) > cfg.SINE_PURITY_THRESHOLD:
+            sine_purity_mult = cfg.SINE_PURITY_SQI_MULT
+
+    bio_penalty = physio_prior * sine_purity_mult
 
     sig=signal-np.mean(signal); sig=scipy_detrend(sig,type="linear")
     n=len(sig); fft_v=np.abs(np.fft.rfft(sig*np.hanning(n)))**2
@@ -915,7 +938,16 @@ def compute_sqi(signal, fps, peak_bpm, motion_score=0.0, mean_brightness=128.0,
             raw *= (1.0 - consensus_pen)
             
     overall=raw*100.0 * bio_penalty
-    if prev_sqi>0: overall=0.40*prev_sqi+0.60*overall
+    # NOTE: bio_penalty (physiological prior × sinusoidal purity) is applied BEFORE
+    # temporal smoothing.  This prevents artifact SQI from being sustained by prev_sqi
+    # momentum — a zombie can't hide behind its own history.
+    # When bio_penalty is extreme (e.g. 0.18 for >130 BPM), bypass smoothing entirely
+    # so the penalty takes immediate effect.
+    if prev_sqi > 0 and bio_penalty > 0.50:
+        overall = 0.40 * prev_sqi + 0.60 * overall
+    elif prev_sqi > 0 and bio_penalty <= 0.50:
+        # Hard penalty: do NOT smooth with history — let it hit immediately
+        pass   # overall already contains the bio_penalty; no blending
     overall=round(min(100.0,max(0.0,overall)),1)
     
     breakdown={
@@ -944,6 +976,14 @@ def get_roi_polygon_masked(frame, face_landmarks, landmark_ids, h, w):
 
 
 def compute_dynamic_roi_weight(roi, base_weight, motion_score, exposure_drift=0.0):
+
+    # ── Harmonic Zombie Gate ───────────────────────────────────────────────────
+    # This MUST come first and return 0.0 directly, bypassing DYN_WEIGHT_MIN clip.
+    # Confirmed zombies are completely excluded from fusion; they must not receive
+    # any authority just because they are the "last man standing".
+    zombie_streak = getattr(roi, '_harmonic_zombie_streak', 0)
+    if zombie_streak >= cfg.ZOMBIE_LOCK_FRAMES or getattr(roi, 'is_harmonic_suspect', False):
+        return 0.0
 
     snr_val=roi.roi_snr
 
@@ -991,38 +1031,65 @@ def compute_dynamic_roi_weight(roi, base_weight, motion_score, exposure_drift=0.
 
 
 def cross_roi_harmonic_check(rois_dict):
+    """
+    Streak-based harmonic zombie detection.
 
+    Strategy:
+    - Each frame where ROI_A.bpm ≈ 2 × ROI_B.bpm, increment ROI_A's zombie streak.
+    - Streak 1-4: growing suspicion → progressive SQI/agreement penalty.
+    - Streak ≥ ZOMBIE_LOCK_FRAMES: confirmed zombie → nuclear SQI nuke + is_harmonic_suspect=True.
+    - compute_dynamic_roi_weight() checks is_harmonic_suspect and returns 0.0,
+      bypassing DYN_WEIGHT_MIN so the zombie cannot win by normalization.
+    - If ratio dissolves: decay streak; clear flag at 0.
+    """
 
     if not rois_dict: return
-    
 
     roi_list = list(rois_dict.values())
+
     for i in range(len(roi_list)):
         for j in range(len(roi_list)):
             if i == j: continue
             roi_a, roi_b = roi_list[i], roi_list[j]
-            if roi_b.bpm <= 0: continue
-            
+            if roi_b.bpm <= 0 or roi_a.bpm <= 0: continue
+
             ratio = roi_a.bpm / roi_b.bpm
 
+            # ── Strict 2:1 harmonic detection ──────────────────────────────
+            # roi_b is the suspected fundamental; roi_a is the 2x harmonic zombie.
+            # Use lower SQI gate (30) so we don't need a strong reference;
+            # the ratio alone is the primary evidence.
             if 1.85 < ratio < 2.15:
+                if roi_b.sqi > 30:
+                    # Increment zombie streak for roi_a
+                    roi_a._harmonic_zombie_streak = getattr(roi_a, '_harmonic_zombie_streak', 0) + 1
+                    streak = roi_a._harmonic_zombie_streak
 
+                    if streak >= cfg.ZOMBIE_LOCK_FRAMES:
+                        # ── Confirmed zombie: nuclear kill ──────────────
+                        roi_a.is_harmonic_suspect = True
+                        roi_a.sqi *= cfg.ZOMBIE_SQI_NUKE
+                        roi_a.agreement_factor *= 0.05
+                        # dynamic_weight is set to 0.0 by compute_dynamic_roi_weight()
+                        # via the is_harmonic_suspect guard — no need to set here.
+                    else:
+                        # ── Growing suspicion: progressive ramp-down ───
+                        # penalty goes from ~0.70 (streak=1) down to ~0.25 (streak=4)
+                        penalty = max(0.12, 0.85 - streak * cfg.ZOMBIE_SQI_RAMP)
+                        roi_a.sqi *= penalty
+                        roi_a.agreement_factor *= 0.25
+                        roi_a.is_harmonic_suspect = True   # pre-flag so weight starts dropping
+                else:
+                    # Reference ROI SQI too low to confirm — slight decay
+                    roi_a._harmonic_zombie_streak = max(0, getattr(roi_a, '_harmonic_zombie_streak', 0) - 1)
+            else:
+                # Ratio dissolved this frame — decay streak
+                prev_streak = getattr(roi_a, '_harmonic_zombie_streak', 0)
+                roi_a._harmonic_zombie_streak = max(0, prev_streak - 1)
+                if roi_a._harmonic_zombie_streak == 0:
+                    roi_a.is_harmonic_suspect = False
 
-                if roi_b.sqi > 45:
-
-
-                    penalty = 0.2 if roi_b.sqi > 70 else 0.5
-                    
-
-                    if getattr(roi_b, "_prev_stability", 0.5) > 0.8:
-                        penalty *= 0.5
-                        
-                    roi_a.dynamic_weight *= penalty
-                    roi_a.agreement_factor *= 0.1
-                    roi_a.sqi *= penalty
-
-                
-
+    # ── Ref-ROI harmonic suspect tagging (extended ratio check) ───────────────
     ref_roi = max(rois_dict.values(), key=lambda r: r.sqi)
     ref_bpm = ref_roi.bpm; harmonic_ratios = [2.0, 3.0, 0.5, 0.333]; tol_ratio = 0.08
     for name, roi in rois_dict.items():
@@ -1058,7 +1125,14 @@ def hierarchical_fusion(roi_items, min_cluster_weight_frac=None):
     # Normalization Trap Fix: Filter out zero-weight ROIs first
     valid_items = [(n, r, w) for n, r, w in roi_items if w > 0]
     if not valid_items: return 0.0
-    
+
+    # Harmonic Zombie Exclusion: suspects are excluded from the primary fusion pool.
+    # If ALL remaining ROIs are suspects (degenerate case), fall back to non-zero items.
+    clean_items = [(n, r, w) for n, r, w in valid_items if not getattr(r, 'is_harmonic_suspect', False)]
+    if clean_items:
+        valid_items = clean_items
+    # else: only zombies left — fall through with valid_items as-is (graceful degradation)
+
     clamped = [(n, r, float(np.clip(w, cfg.DYN_WEIGHT_MIN, cfg.DYN_WEIGHT_MAX))) for n, r, w in valid_items]
     total_w = sum(c[2] for c in clamped)
     if total_w <= 0: return 0.0
@@ -1768,6 +1842,21 @@ class MultiROIFusionEngineV2(MultiROIFusionEngine):
         roi_bpms = {n: r.bpm for n, r, _ in roi_items_learned}
         self.learned_weighting.update_weights(roi_sqis, fused_bpm_raw, roi_bpms)
         if fused_bpm_raw>0:
+            # ── BPM Inertia Gate ───────────────────────────────────────────
+            # V2 previously had NO inertia — artifact could jump from 84→144 in
+            # one frame with no resistance. Now we apply the same trust-penalty
+            # formula as V1, with a hard-freeze for absurd deltas (>30 BPM).
+            if self._frozen_bpm > 0:
+                delta_bpm = abs(fused_bpm_raw - self._frozen_bpm)
+                if delta_bpm > 30.0:
+                    # Absurd jump: freeze and wait for convergence
+                    result.fused_bpm = self._frozen_bpm
+                    result.bpm_locked = True
+                    self.session_scorer.update(result.fused_sqi,result.fused_bpm,is_moving,roi_agreement=result.roi_agreement); result.session_confidence=self.session_scorer.get_confidence(); result.roi_signals={k:v for k,v in self.rois.items()}; return result
+                elif delta_bpm > 15.0:
+                    trust = float(np.exp(-(delta_bpm - 15.0) / 10.0))
+                    fused_bpm_raw = trust * fused_bpm_raw + (1.0 - trust) * self._frozen_bpm
+            # ─────────────────────────────────────────────────────────────
             smoothed=self.bpm_smoother.update(fused_bpm_raw); stabilized=self.bpm_median_stab.update(smoothed); result.fused_bpm=stabilized; self._frozen_bpm=stabilized; sws=sum(compute_dynamic_roi_weight(v[0],ROI_CONFIGS[k]["base_weight"],motion_score,result.exposure_drift)*v[0].sqi for k,v in accepted.items() if v[0].sqi>=SQI_HARD_GATE); swd=sum(compute_dynamic_roi_weight(v[0],ROI_CONFIGS[k]["base_weight"],motion_score,result.exposure_drift) for k,v in accepted.items() if v[0].sqi>=SQI_HARD_GATE); result.fused_sqi=sws/swd if swd>0 else 0.0
             n_valid_rois_v2 = len(accepted)
             if n_valid_rois_v2 < 2: result.fused_sqi *= cfg.SINGLE_ROI_SQI_MULT
