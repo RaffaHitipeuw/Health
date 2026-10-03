@@ -4,7 +4,7 @@ from scipy.signal import butter, filtfilt, find_peaks, welch
 from scipy.stats import pearsonr
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Tuple
 import time
 
 
@@ -40,12 +40,17 @@ class HealthBaseline:
 class GroundTruthInterface:
     SOURCES = ['manual', 'pulse_oximeter', 'smartwatch_ppg', 'ecg']
 
-    def __init__(self):
+    # Default alignment tolerance in seconds
+    DEFAULT_ALIGN_TOLERANCE: float = 2.0
+
+    def __init__(self, align_tolerance: float = 2.0):
         self.gt_bpm_series: list = []
         self.est_bpm_series: list = []
         self.current_gt_bpm: Optional[float] = None
         self.current_source: str = 'manual'
         self._last_update: float = 0.0
+        self.align_tolerance: float = align_tolerance
+        self._last_alignment: dict = {}
 
     def set_ground_truth(self, bpm: float, source: str='manual'):
         assert source in self.SOURCES, f'Unknown GT source: {source}'
@@ -59,9 +64,116 @@ class GroundTruthInterface:
         if bpm > 0:
             self.est_bpm_series.append((time.time(), bpm))
 
-    def compute_bland_altman(self) -> dict:
+    def align_observations(self, tolerance: float = None) -> Tuple[np.ndarray, np.ndarray, dict]:
+        """
+        Align estimated and ground-truth observations by timestamp.
+
+        Each observation has a (timestamp, value) tuple.
+        Estimates are matched to the nearest ground-truth observation within tolerance.
+
+        Parameters
+        ----------
+        tolerance : float
+            Maximum time difference (seconds) to accept a match.
+            Defaults to self.align_tolerance.
+
+        Returns
+        -------
+        aligned_est : np.ndarray
+            Estimated BPM values for matched pairs.
+        aligned_gt : np.ndarray
+            Ground truth BPM values for matched pairs.
+        diagnostics : dict
+            Alignment statistics: n_matched, n_unmatched_est, n_unmatched_gt, tolerance.
+        """
+        tolerance = tolerance if tolerance is not None else self.align_tolerance
+
+        if not self.gt_bpm_series or not self.est_bpm_series:
+            diagnostics = {
+                'n_matched': 0, 'n_unmatched_est': len(self.est_bpm_series),
+                'n_unmatched_gt': len(self.gt_bpm_series),
+                'tolerance': tolerance,
+            }
+            self._last_alignment = diagnostics
+            return np.array([]), np.array([]), diagnostics
+
+        # Sort by timestamp for efficient matching
+        gt_sorted = sorted(self.gt_bpm_series, key=lambda x: x[0])
+        est_sorted = sorted(self.est_bpm_series, key=lambda x: x[0])
+
+        matched_est = []
+        matched_gt = []
+        used_gt_indices = set()
+
+        for est_ts, est_val in est_sorted:
+            # Find nearest unused GT within tolerance
+            best_idx = None
+            best_dt = tolerance + 1.0
+            for i, (gt_ts, gt_val, gt_src) in enumerate(gt_sorted):
+                if i in used_gt_indices:
+                    continue
+                dt = abs(est_ts - gt_ts)
+                if dt < best_dt:
+                    best_dt = dt
+                    best_idx = i
+            if best_idx is not None:
+                matched_est.append(est_val)
+                matched_gt.append(gt_sorted[best_idx][1])
+                used_gt_indices.add(best_idx)
+
+        diagnostics = {
+            'n_matched': len(matched_est),
+            'n_unmatched_est': len(est_sorted) - len(matched_est),
+            'n_unmatched_gt': len(gt_sorted) - len(matched_gt),
+            'tolerance': tolerance,
+        }
+        self._last_alignment = diagnostics
+
+        return np.array(matched_est), np.array(matched_gt), diagnostics
+
+    def compute_bland_altman(self, use_alignment: bool = True,
+                            tolerance: float = None) -> dict:
+        """Compute Bland-Altman metrics.
+
+        Parameters
+        ----------
+        use_alignment : bool
+            If True (default), uses timestamp-based nearest-neighbor matching.
+            If False, uses index-based pairing (last n elements).
+        tolerance : float
+            Maximum time difference for matching (seconds). Only used when
+            use_alignment=True.
+        """
+        if use_alignment:
+            est_arr, gt_arr, diagnostics = self.align_observations(tolerance)
+            if len(est_arr) < 5:
+                return {'error': 'insufficient_aligned_data',
+                        'n_matched': len(est_arr),
+                        **diagnostics}
+            diffs = est_arr - gt_arr
+            means = (est_arr + gt_arr) / 2.0
+            mean_diff = float(np.mean(diffs))
+            std_diff = float(np.std(diffs))
+            loa_upper = mean_diff + 1.96 * std_diff
+            loa_lower = mean_diff - 1.96 * std_diff
+            return {
+                'n_matched': len(est_arr),
+                'mean_diff_bpm': round(mean_diff, 2),
+                'std_diff_bpm': round(std_diff, 2),
+                'loa_upper': round(loa_upper, 2),
+                'loa_lower': round(loa_lower, 2),
+                'mae': round(float(np.mean(np.abs(diffs))), 2),
+                'rmse': round(float(np.sqrt(np.mean(diffs ** 2))), 2),
+                'source': self.current_source,
+                'alignment_tolerance': diagnostics['tolerance'],
+                'n_unmatched_est': diagnostics['n_unmatched_est'],
+                'n_unmatched_gt': diagnostics['n_unmatched_gt'],
+            }
+
+        # Legacy index-based pairing
         if len(self.gt_bpm_series) < 5 or len(self.est_bpm_series) < 5:
-            return {'error': 'insufficient_data', 'n': min(len(self.gt_bpm_series), len(self.est_bpm_series))}
+            return {'error': 'insufficient_data',
+                    'n': min(len(self.gt_bpm_series), len(self.est_bpm_series))}
         gt_bpms = [g[1] for g in self.gt_bpm_series]
         est_bpms = [e[1] for e in self.est_bpm_series]
         n = min(len(gt_bpms), len(est_bpms))
@@ -75,7 +187,35 @@ class GroundTruthInterface:
         loa_lower = mean_diff - 1.96 * std_diff
         return {'n': n, 'mean_diff_bpm': round(mean_diff, 2), 'std_diff_bpm': round(std_diff, 2), 'loa_upper': round(loa_upper, 2), 'loa_lower': round(loa_lower, 2), 'mae': round(float(np.mean(np.abs(diffs))), 2), 'rmse': round(float(np.sqrt(np.mean(diffs ** 2))), 2), 'source': self.current_source}
 
-    def compute_pearson(self) -> dict:
+    def compute_pearson(self, use_alignment: bool = True,
+                        tolerance: float = None) -> dict:
+        """Compute Pearson correlation.
+
+        Parameters
+        ----------
+        use_alignment : bool
+            If True (default), uses timestamp-based nearest-neighbor matching.
+        tolerance : float
+            Maximum time difference for matching (seconds).
+        """
+        if use_alignment:
+            est_arr, gt_arr, diagnostics = self.align_observations(tolerance)
+            if len(est_arr) < 3:
+                return {'error': 'insufficient_aligned_data',
+                        'n_matched': len(est_arr),
+                        **diagnostics}
+            try:
+                r, p = pearsonr(est_arr, gt_arr)
+                return {'pearson_r': round(float(r), 4),
+                        'p_value': round(float(p), 4),
+                        'n_matched': len(est_arr),
+                        'n_unmatched_est': diagnostics['n_unmatched_est'],
+                        'n_unmatched_gt': diagnostics['n_unmatched_gt'],
+                        'alignment_tolerance': diagnostics['tolerance']}
+            except Exception as e:
+                return {'error': str(e)}
+
+        # Legacy index-based
         gt_bpms = [g[1] for g in self.gt_bpm_series]
         est_bpms = [e[1] for e in self.est_bpm_series]
         n = min(len(gt_bpms), len(est_bpms))
@@ -87,10 +227,15 @@ class GroundTruthInterface:
         except Exception as e:
             return {'error': str(e)}
 
+    def get_alignment_diagnostics(self) -> dict:
+        """Return diagnostics from the last alignment."""
+        return dict(self._last_alignment)
+
     def clear(self):
         self.gt_bpm_series.clear()
         self.est_bpm_series.clear()
         self.current_gt_bpm = None
+        self._last_alignment = {}
 
 class FailureModeLogger:
 
@@ -373,7 +518,7 @@ class VitalsEngine:
         metrics['std_bpm'] = round(float(np.std(hist)), 2)
         if ground_truth_bpm is not None and hist:
             errors = [abs(b - ground_truth_bpm) for b in hist]
-            metrics['MAE'] = round(float(np.mean(errors)), 2)   
+            metrics['MAE'] = round(float(np.mean(errors)), 2)
             metrics['RMSE'] = round(float(np.sqrt(np.mean([e ** 2 for e in errors]))), 2)
         if estimated_bpm_series is not None and ground_truth_series is not None and (len(estimated_bpm_series) == len(ground_truth_series)) and (len(estimated_bpm_series) > 2):
             try:

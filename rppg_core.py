@@ -133,7 +133,12 @@ class FrameResult:
     subharm_corrected: bool  = False
     physio_state:    str          = "RESTING"
     resp_rate_bpm:   float        = 0.0
-    cardiac_fraction: float       = 1.0
+    cardiac_fraction: float        = 1.0
+    # Separate signal paths for cardiac and respiration estimation
+    # cardiac_signal: pre-filtered (cardiac bandpassed) signal for HR estimation
+    # resp_signal: unfiltered/preprocessed signal with respiratory band intact for respiration estimation
+    cardiac_signal: np.ndarray = field(default_factory=lambda: np.array([]))
+    resp_signal: np.ndarray  = field(default_factory=lambda: np.array([]))
 
 
 class ExposureCompensator:
@@ -379,12 +384,20 @@ class SkinToneCalibrator:
     def get_normalization_factors(self): return self.nf_r, 1.0, self.nf_b
 
     def skin_type_label(self):
+        """
+        Return a luminance-based skin appearance group label.
+
+        Note: This is NOT a Fitzpatrick skin type classification.
+        This is a simple luminance grouping based on mean channel brightness.
+        It does not correlate with actual Fitzpatrick scale (I-VI).
+        Use for diagnostics only.
+        """
         if not self.g_history: return "UNKNOWN"
 
         lum = (np.mean(self.r_history) + np.mean(self.g_history) + np.mean(self.b_history)) / 3.0
-        if lum > 180: return "TYPE I-II"
-        if lum > 120: return "TYPE III-IV"
-        return "TYPE V-VI"
+        if lum > 180: return "LUM-A"   # Bright appearance
+        if lum > 120: return "LUM-B"   # Medium appearance
+        return "LUM-C"                  # Dark appearance
 
     def reset(self):
         self.r_history.clear(); self.g_history.clear(); self.b_history.clear()
@@ -407,6 +420,17 @@ class MotionArtifactDetector:
         self._prev_raw     = 0.0
 
         self._lm_ids = [1, 33, 263, 61, 291, 199, 168, 4, 234, 454, 10, 152]
+
+    @property
+    def enter_threshold(self):
+        """Threshold for entering motion-rejected state. Provided for callers that
+        access the detector's internal thresholds."""
+        return cfg.MOTION_ENTER_THRESHOLD
+
+    @property
+    def exit_threshold(self):
+        """Threshold for exiting motion-rejected state."""
+        return cfg.MOTION_EXIT_THRESHOLD
 
     def update(self, gray, face_landmarks, h, w):
         if face_landmarks is None:
@@ -1964,19 +1988,49 @@ class MultiROIFusionEngineV2(MultiROIFusionEngine):
                 if len(ag)>=self.MIN_FRAMES: valid_rois_res[k]=(v,ar,ag,ab,fps)
         if not valid_rois_res: result.roi_signals={k:v for k,v in self.rois.items()}; return result
         weighted_sigs=[]
+
+        # ── FIX: Track both cardiac-filtered (sf) and unfiltered (sd) signals separately ──
+        # sd = unfiltered/preprocessed signal with respiratory band intact → for respiration
+        # sf = cardiac-bandpass filtered → for HR estimation
+        resp_signals=[]
+
         for roi_name,(roi,arr_r,arr_g,arr_b,eff_fps) in valid_rois_res.items():
             try:
                 self.resp_suppressor.update_resp_freq(arr_g,eff_fps); sc,_,_=self.arbitrator.select_best(arr_r,arr_g,arr_b,eff_fps); sd=scipy_detrend(sc,type="linear"); sd=self.exposure_comp.normalize_roi_signal(sd); sd=self.resp_suppressor.suppress(sd,eff_fps); sf=bandpass_filter(sd,eff_fps)
                 _std2=float(np.std(sf))
                 if _std2>1e-8: sf=(sf-np.mean(sf))/_std2
+
+                # ── Physiological state classifier: uses UNFILTERED signal (sd) ──
+                # V2 was missing this call entirely. The classifier needs the respiratory
+                # band (0.1-0.5 Hz) which is removed by cardiac bandpass filtering (sf).
+                # sd preserves this band while still being detrended/normalized.
+                # NOTE: panting_adapter.update() is called AFTER bpm_raw is assigned (line 2021),
+                # not inside this if-block, because bpm_raw is not yet defined here.
+                # Track state locally so it is available after the bpm_raw computation.
+                _current_state = PhysioState.RESTING
+                if len(sd) >= max(30, int(eff_fps * 3)):
+                    # Pass unfiltered signal for respiration estimation
+                    _roi_sigs_v2 = {k2: np.array(list(v[0].buf_g)[-cfg.BUFFER_SIZE:]) for k2, v in valid_rois_res.items() if len(v[0].buf_g) >= 30}
+                    _physio_v2 = self.physio_classifier.update(sd, eff_fps, motion_score, _roi_sigs_v2)
+                    result.physio_state    = _physio_v2.state.value
+                    result.resp_rate_bpm   = _physio_v2.resp_rate_bpm
+                    result.cardiac_fraction = _physio_v2.cardiac_fraction
+                    _current_state = _physio_v2.state
+
                 bpm_raw,freqs,power,fft_val=estimate_bpm_fft(sf,eff_fps,roi_name=roi_name)
                 sqi,breakdown=compute_sqi(sf,eff_fps,bpm_raw,motion_score=motion_score,mean_brightness=result.frame_brightness,roi_brightness=roi.roi_brightness,fft_validation=fft_val,prev_sqi=roi.sqi,roi_obj=roi,exposure_drift=result.exposure_drift)
                 roi.bpm=bpm_raw; roi.sqi=sqi; roi.roi_snr=breakdown.get("snr",0.0); roi.roi_regularity=breakdown.get("regularity",0.0)
+
+                # ── Physiological state adapter: uses per-ROI bpm_raw after it's computed ──
+                # pant_eting_adapter.update() needs the PhysioState enum, tracked in _current_state.
+                self.panting_adapter.update(bpm_raw, _current_state)
                 if bpm_raw>0: roi._bpm_history.append(bpm_raw)
                 self.conf_trend.push(sqi)
                 if self.enable_logging and self.repro_logger: self.repro_logger.log_frame(now,roi_name,float(arr_r[-1]),float(arr_g[-1]),float(arr_b[-1]),bpm_raw,sqi); self.repro_logger.log_sqi(now,roi_name,sqi,breakdown)
                 if sqi>result.sqi_breakdown.get("overall",0) and len(sf)>0: result.freqs=freqs; result.power=power; result.sqi_breakdown=breakdown
                 if len(sf)>0 and sqi>0: weighted_sigs.append((sf,sqi,roi_name))
+                # ── Store unfiltered signal for respiration path ──
+                if len(sd)>0 and sqi>0: resp_signals.append((sd,sqi,roi_name))
             except Exception as _exc:
                 roi.sqi = 0.0
                 _rppg_warn(f'ROI processing (frame {getattr(self,"frame_count",0)})', _exc)
@@ -2042,7 +2096,18 @@ class MultiROIFusionEngineV2(MultiROIFusionEngine):
             n_valid_rois_v2 = len(accepted)
             if n_valid_rois_v2 < 2: result.fused_sqi *= cfg.SINGLE_ROI_SQI_MULT
             agr_pen = cfg.AGREEMENT_SQI_PENALTY_COEFF * max(0.0, cfg.AGREEMENT_SQI_PENALTY_BELOW - result.roi_agreement); result.fused_sqi *= max(0.0, 1.0 - agr_pen); result.n_valid_rois = n_valid_rois_v2
-            if weighted_sigs: result.chrom_signal=max(weighted_sigs,key=lambda x:x[1])[0]
+            if weighted_sigs:
+                # cardiac_signal: cardiac-bandpass filtered, for HR FFT display
+                result.cardiac_signal = max(weighted_sigs, key=lambda x: x[1])[0]
+                # resp_signal: unfiltered signal with respiratory band intact, for VitalsEngine
+                # This fixes Issue 2: respiration was being estimated from cardiac-filtered signal
+                if resp_signals:
+                    result.resp_signal = max(resp_signals, key=lambda x: x[1])[0]
+                else:
+                    result.resp_signal = max(weighted_sigs, key=lambda x: x[1])[0]
+                # chrom_signal: for backward compatibility, use resp_signal (unfiltered)
+                # so VitalsEngine._compute_respiration gets a signal with respiratory content
+                result.chrom_signal = result.resp_signal
         self.session_scorer.update(result.fused_sqi,result.fused_bpm,is_moving,roi_agreement=result.roi_agreement); result.session_confidence=self.session_scorer.get_confidence(); result.roi_signals={k:v for k,v in self.rois.items()}; return result
 
     def get_diagnostics(self):

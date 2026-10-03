@@ -117,7 +117,11 @@ class BayesianHREstimator:
         K = P_pred[:, 0] / S
 
         self.x = x_pred + K * innovation
-        self.P = (np.eye(2) - np.outer(K, self.H))
+
+        # Standard Kalman covariance update: P_new = (I - K @ H) @ P_pred
+        # K is (2,1), H is (1,2), so K @ H is (2,2)
+        I_KH = np.eye(2) - np.outer(K, self.H)
+        self.P = I_KH @ P_pred
 
 
         self.x[0] = float(np.clip(self.x[0], 42.0, 200.0))

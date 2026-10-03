@@ -136,7 +136,6 @@ def draw_spectrum_graph(canvas, freqs, power, peak_bpm, h, w):
 def draw_vitals_panel(canvas, vitals: VitalsResult, baseline_dev: dict, h: int, w: int):
     draw_panel(canvas, 0, 0, w, h)
 
-
     sqi_val = getattr(vitals, "sqi", 0.0)
     bpm_color = (PALETTE["green"]  if sqi_val >= 55 else
                  PALETTE["yellow"] if sqi_val >= 35 else
@@ -148,12 +147,15 @@ def draw_vitals_panel(canvas, vitals: VitalsResult, baseline_dev: dict, h: int, 
 
         ("BPM",      f"{vitals.bpm:.0f}" if vitals.bpm > 0 else "--",
                                              "bpm",    bpm_color),
-        ("RESP",     f"{vitals.resp_rate:.1f}",   "br/min",  PALETTE["cyan"]),
-        ("HRV SDNN", f"{vitals.hrv_sdnn:.1f}",    "ms",      PALETTE["purple"]),
-        ("HRV RMSSD", f"{vitals.hrv_rmssd:.1f}",  "ms",      PALETTE["purple"]),
-        ("pNN50",    f"{vitals.hrv_pnn50:.1f}",    "%",       PALETTE["yellow"]),
-        ("LF/HF",    f"{vitals.lf_hf_ratio:.2f}",  "",       PALETTE["orange"]),
-        ("STRESS",   f"{vitals.stress_index:.0f}", "/100",    bpm_label),
+        # ── Core measurement ──────────────────────────────────────────────
+
+        # ── Experimental vitals (not clinically validated) ───────────────
+        ("RESP",     f"{vitals.resp_rate:.1f}",   "br/min  [EXP]", PALETTE["cyan"]),
+        ("HRV SDNN", f"{vitals.hrv_sdnn:.1f}",   "ms  [EXP]",    PALETTE["purple"]),
+        ("HRV RMSSD", f"{vitals.hrv_rmssd:.1f}",  "ms  [EXP]",    PALETTE["purple"]),
+        ("pNN50",    f"{vitals.hrv_pnn50:.1f}",   "%  [EXP]",      PALETTE["yellow"]),
+        ("LF/HF",    f"{vitals.lf_hf_ratio:.2f}",  "  [EXP]",      PALETTE["orange"]),
+        ("STRESS",   f"{vitals.stress_index:.0f}", "[EXP]",         bpm_label),
     ]
 
     col_w = w // 3
@@ -301,10 +303,28 @@ def draw_history_panel(canvas, history_rows: list, trend: dict, h: int, w: int):
         put_text(canvas, t_text, 10, h - 8, 0.32, PALETTE["gray"])
 
 
-def main():
+# =============================================================================
+# ACTIVE ENGINE DOCUMENTATION
+# =============================================================================
+# The active processing engine is MultiROIFusionEngineV2 (rppg_core.py).
+# V1 (MultiROIFusionEngine) is the legacy baseline implementation.
+#
+# Architecture:
+#   rppg_main.py → calls MultiROIFusionEngineV2
+#   V2 uses: PhysiologicalStateClassifier, PantingAdaptiveHR, BayesianHREstimator,
+#            KalmanBPMFilter, ProbabilisticFusion, MultiROI fusion, SQI gating,
+#            respiratory artifact suppression, head pose gating, jaw blink suppression,
+#            micro-motion detection, timestamp resampling, confidence trending.
+#   V1 uses: PhysiologicalStateClassifier, PantingAdaptiveHR, BayesianHREstimator,
+#            KalmanBPMFilter, ProbabilisticFusion, basic MultiROI fusion, SQI gating.
+#   Shared components: ROI configs, bandpass_filter, estimate_bpm_fft, compute_sqi.
+# =============================================================================
+
+
+def main(enable_logging=False):
 
     cap = None
-    for idx in [1, 2]:
+    for idx in [0, 1, 2]:
         temp_cap = cv2.VideoCapture(idx)
         if temp_cap.isOpened():
             cap = temp_cap
@@ -333,7 +353,7 @@ def main():
         min_tracking_confidence=0.6
     )
 
-    fusion_engine  = MultiROIFusionEngineV2(enable_logging=False)
+    fusion_engine  = MultiROIFusionEngineV2(enable_logging=enable_logging)
     vitals_engine  = VitalsEngine()
     session_hist   = SessionHistory()
     guidance_eng   = WellnessGuidanceEngine()
@@ -449,8 +469,10 @@ def main():
 
             if display_bpm > 0 and fr.fused_sqi >= SQI_HARD_GATE:
                 bpm_series.append(display_bpm)
-                if ground_truth:
-                    gt_series.append(ground_truth)
+                # FIX Issue 8: Do NOT repeatedly append ground_truth to gt_series.
+                # GroundTruthInterface already records each gt entry with a timestamp.
+                # Benchmark should use align_observations() instead of index-based pairing.
+                # gt_series is kept for legacy metrics only; prefer align_observations().
 
         if frame_count % 90 == 0 and display_bpm > 0 and fr.fused_sqi >= SQI_HARD_GATE and not fr.motion_rejected:
             if now - last_ai_check > 30:
@@ -776,4 +798,11 @@ def main():
     print("[INFO] Done.\n")
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description="rPPG Research System")
+    parser.add_argument(
+        "--log", action="store_true",
+        help="Enable reproducibility logging for research sessions"
+    )
+    args = parser.parse_args()
+    main(enable_logging=args.log)

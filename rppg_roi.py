@@ -33,9 +33,9 @@ class AdaptiveROIManager:
 
         if self.skin_mask is None:
             self.segment_skin(frame_bgr)
+
+
             
-
-
         return self.skin_mask
 
     def get_adaptive_roi(self, frame_bgr, landmarks, landmark_ids, h, w):

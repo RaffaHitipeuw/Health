@@ -146,7 +146,7 @@ class RPPGConfig:
     PEAK_PROMINENCE_MIN: float = 0.40
     CONSENSUS_STD_MAX: float = 8.0
     PEAK_DOMINANCE_RATIO_MIN: float = 2.0
-    
+
     PEAK_PERSISTENCE_LIMIT: int = 150 # Frames before we suspect peak locking
     PEAK_PERSISTENCE_BPM_TOL: float = 1.0
 
