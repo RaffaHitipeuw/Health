@@ -219,27 +219,64 @@ class BenchmarkRunner:
             raise ValueError(f"Cannot initialize video: {e}")
 
     def _initialize_face_mesh(self):
-        """Initialize MediaPipe FaceMesh."""
-        if mp is None:
-            raise RuntimeError(
-                "MediaPipe is not installed. "
-                "Install with: pip install mediapipe"
-            )
+        """Initialize face landmark detector with MediaPipe Tasks API preference.
 
-        if hasattr(mp, 'solutions') and hasattr(mp.solutions, 'face_mesh'):
-            # MediaPipe 0.9.x and earlier - use legacy API
-            return mp.solutions.face_mesh.FaceMesh(
+        Priority order:
+        1. MediaPipe Tasks FaceLandmarker (genuine ML-based, TFLite)
+        2. MediaPipe legacy FaceMesh (if available)
+        3. OpenCV DNN fallback (NOT for scientific benchmarks)
+
+        Note: The OpenCV DNN fallback uses geometric template projection,
+        NOT genuine ML-based landmarks. It should NOT be used for scientific
+        benchmark results (see GATE 1 requirements).
+        """
+        # Try MediaPipe Tasks API first (genuine ML-based landmarks)
+        try:
+            from rppg_benchmark_face_landmarker import get_face_landmarker
+            face_mesh = get_face_landmarker(
+                max_num_faces=1,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+            print("[BENCHMARK] Using MediaPipe Tasks FaceLandmarker (genuine ML-based)")
+            return face_mesh
+        except ImportError as e:
+            print(f"[BENCHMARK] FaceLandmarker adapter not available: {e}")
+        except Exception as e:
+            print(f"[BENCHMARK] FaceLandmarker initialization failed: {e}")
+
+        # Try legacy MediaPipe FaceMesh (if available)
+        if mp is not None and hasattr(mp, 'solutions') and hasattr(mp.solutions, 'face_mesh'):
+            try:
+                face_mesh = mp.solutions.face_mesh.FaceMesh(
+                    max_num_faces=1,
+                    refine_landmarks=True,
+                    min_detection_confidence=0.5,
+                    min_tracking_confidence=0.5,
+                )
+                print("[BENCHMARK] Using legacy MediaPipe FaceMesh")
+                return face_mesh
+            except Exception as e:
+                print(f"[BENCHMARK] Legacy MediaPipe initialization failed: {e}")
+
+        # Last resort: OpenCV DNN (WARNING: NOT for scientific benchmarks!)
+        # This uses geometric template projection, NOT genuine ML landmarks
+        try:
+            from rppg_benchmark_face_dnn import get_face_mesh_fallback
+            face_mesh = get_face_mesh_fallback(
                 max_num_faces=1,
                 refine_landmarks=True,
                 min_detection_confidence=0.5,
                 min_tracking_confidence=0.5,
             )
-        else:
-            # MediaPipe 0.10+ detected - needs legacy solutions API
+            print("[BENCHMARK] WARNING: Using OpenCV DNN fallback")
+            print("[BENCHMARK] WARNING: This uses template projection, NOT genuine ML landmarks")
+            print("[BENCHMARK] WARNING: Results are NOT scientifically valid!")
+            return face_mesh
+        except Exception as e:
             raise RuntimeError(
-                "MediaPipe 0.10+ detected, which uses a different API. "
-                "This benchmark requires MediaPipe with face_mesh solutions API. "
-                "Install an older version: pip install mediapipe==0.9.0"
+                f"Could not initialize face detector. "
+                f"All landmark sources failed: {e}"
             )
 
     def _initialize_fusion_engine(self) -> MultiROIFusionEngineV2:
